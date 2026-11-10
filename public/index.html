@@ -1001,10 +1001,34 @@ const SB = (function(){
     }catch(e){ return {ok:false,err:e.message,list:[]}; }
   }
 
-  // Auto-init from saved config
+  // Auto-init from saved config + auto-pull semua data terbaru dari Supabase
   (async function autoInit(){
     const cfg=loadCfg();
-    if(cfg&&cfg.url&&cfg.key){ await init(cfg.url,cfg.key); try{re();}catch(e){} }
+    if(!cfg||!cfg.url||!cfg.key) return;
+    await init(cfg.url,cfg.key);
+    if(_status==='connected'){
+      try{
+        // Auto-pull: ambil daftar periode yang ada di Supabase lalu pull semua
+        addLog('⏳ Auto-pull data dari Supabase...');
+        const types=['sales','budget','damage'];
+        let totalPulled=0;
+        for(const type of types){
+          const ls=await listPeriods(type);
+          if(!ls.ok||!ls.list||ls.list.length===0) continue;
+          for(const {year,month} of ls.list){
+            const r=await pullPeriod(type,year,month);
+            if(r.ok&&r.rows&&r.rows.length>0){
+              if(type==='sales') Store.setSales(year,month,r.rows);
+              else if(type==='budget') Store.setBudget(year,month,r.rows);
+              else Store.setDamage(year,month,r.rows);
+              totalPulled+=r.rows.length;
+            }
+          }
+        }
+        addLog(`✅ Auto-pull selesai: ${totalPulled} rows`);
+      }catch(e){ addLog('⚠ Auto-pull gagal: '+e.message, false); }
+    }
+    try{re();}catch(e){}
   })();
 
   return {
