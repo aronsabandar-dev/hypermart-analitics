@@ -854,8 +854,17 @@ const SB = (function(){
 
   const CFG_KEY = 'sbConfig';
 
+  // Default config — hardcoded agar semua user langsung connect tanpa setup
+  const DEFAULT_CFG = {
+    url: 'https://qanhamqeclezygdoobgx.supabase.co',
+    key: 'sb_publishable_ek-IEe-WmQ1AHyYGMjuLTA_-DiaSBD4'
+  };
   function loadCfg(){
-    try{ return JSON.parse(localStorage.getItem(CFG_KEY)||'null'); }catch(e){ return null; }
+    try{
+      const saved = JSON.parse(localStorage.getItem(CFG_KEY)||'null');
+      // Kalau belum pernah simpan config, pakai default
+      return saved || DEFAULT_CFG;
+    }catch(e){ return DEFAULT_CFG; }
   }
   function saveCfg(cfg){
     try{ localStorage.setItem(CFG_KEY, JSON.stringify(cfg)); }catch(e){}
@@ -2681,7 +2690,7 @@ function pageReport(){
           </div>
           <div style="font-size:11px;color:var(--tm);margin-bottom:14px;line-height:1.7;background:var(--bg3);padding:10px;border-radius:6px">
             ✦ Sales per SKU &nbsp;|&nbsp; ✦ Performa per Dept &nbsp;|&nbsp; ✦ Top 10 SKU &nbsp;|&nbsp; ✦ Damage Summary<br>
-            <span style="color:var(--blue);font-weight:600">Design by Armstrong Sabandar</span>
+            <span style="color:var(--tm);opacity:.45;font-size:9px">Design by Armstrong Sabandar</span>
           </div>
           <button onclick="window._genReport('all')" class="btn btn-p" style="width:100%;justify-content:center;font-size:14px;padding:12px">
             📄 Generate PDF — ${dept==='all'?'Semua Dept':dept+' '+esc(DEPTS[dept]||'')}
@@ -3157,9 +3166,8 @@ function pageLogin(){
         <div class="fg"><label class="fl">Password</label><input class="inp" type="password" id="loginPass" placeholder="Password" autocomplete="current-password"/></div>
         <div id="loginErr" style="color:var(--red);font-size:12px;margin-bottom:10px;display:none"></div>
         <button class="btn btn-s" style="width:100%" id="loginBtn">Sign In</button>
-        <div style="margin-top:20px;padding-top:16px;border-top:1px solid var(--bd);text-align:center">
-          <div style="font-size:12px;font-weight:800;color:var(--blue);letter-spacing:.5px;text-transform:uppercase">Design by Armstrong Sabandar</div>
-          <div style="font-size:10px;color:var(--tm);margin-top:3px">Hypermart 284 Ambon City Center</div>
+        <div style="margin-top:20px;text-align:center">
+          <div style="font-size:9px;color:var(--tm);opacity:.45;letter-spacing:.3px">Design by Armstrong Sabandar</div>
         </div>
       </div>
     </div>
@@ -3207,12 +3215,8 @@ function render(){
       </div>
       <div class="page">${pageHtml}</div>
       <div style="text-align:center;padding:14px 24px 18px;border-top:1px solid var(--bd);background:var(--bg2);margin-top:8px">
-        <div style="font-size:12px;font-weight:800;color:var(--blue);letter-spacing:.8px;text-transform:uppercase;display:inline-flex;align-items:center;gap:8px">
-          <span style="color:var(--amber)">✦</span>
-          Design by Armstrong Sabandar
-          <span style="color:var(--amber)">✦</span>
-        </div>
-        <div style="font-size:10px;color:var(--tm);margin-top:3px">Hypermart 284 Ambon City Center — MPPA Retail Group</div>
+        <div style="font-size:9px;color:var(--tm);opacity:.45;letter-spacing:.3px">Design by Armstrong Sabandar</div>
+        <div style="font-size:9px;color:var(--tm);opacity:.35;margin-top:2px">Hypermart 284 Ambon City Center — MPPA Retail Group</div>
       </div>
     </div>
     <div class="mnav"><div class="mnavi">
