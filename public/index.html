@@ -60,7 +60,6 @@ input,select{font-family:inherit;border:none;outline:none}
   body>*:not(#pdfView){display:none!important}}
 .sidebar.collapsed{width:52px;overflow:hidden}
 .sidebar.collapsed .stxt,.sidebar.collapsed .ssub,.sidebar.collapsed .nlbl,.sidebar.collapsed .ni span,.sidebar.collapsed .wslbl{display:none!important}
-.sidebar.collapsed .ni{justify-content:center;padding:9px 0;width:52px}
 .sidebar.collapsed .suser{display:none!important}
 .sidebar.collapsed .uav{margin:0}
 .sidebar.collapsed .slogo{padding:8px 0;justify-content:center;align-items:center;flex-direction:column;width:52px}
@@ -70,7 +69,13 @@ input,select{font-family:inherit;border:none;outline:none}
 .sidebar.collapsed [style*="Design by"]{display:none!important}
 .sidebar.collapsed [style*="padding:8px 18px"]{display:none!important}
 .sidebar.collapsed .snav{padding:4px 0}
-.sidebar.collapsed .snav .ni{display:flex;justify-content:center;align-items:center;padding:10px 0;width:52px;overflow:hidden}
+/* Nav item saat collapsed: icon center, tidak ada overflow teks */
+.sidebar.collapsed .ni{display:flex;justify-content:center;align-items:center;padding:10px 0;width:52px;gap:0;overflow:hidden;border-left-width:2px}
+.sidebar.collapsed .ni svg{width:17px;height:17px;opacity:.75;flex-shrink:0}
+.sidebar.collapsed .ni.on svg{opacity:1}
+/* Tooltip nama menu saat collapsed hover */
+.sidebar.collapsed .ni{position:relative}
+.sidebar.collapsed .ni:hover::after{content:attr(title);position:absolute;left:54px;top:50%;transform:translateY(-50%);background:var(--bg3);color:var(--t1);font-size:12px;font-weight:500;padding:5px 10px;border-radius:6px;white-space:nowrap;z-index:200;box-shadow:0 2px 8px rgba(0,0,0,.15);border:1px solid var(--bd);pointer-events:none}
 .sidebar.collapsed ~ .main{margin-left:52px}
 .collapse-btn{width:100%;display:flex;align-items:center;justify-content:flex-end;padding:6px 10px;background:none;border:none;cursor:pointer;color:var(--tm);font-size:14px;border-top:1px solid var(--bd)}
 .sidebar.collapsed .collapse-btn{justify-content:center;padding:6px 0}
@@ -873,6 +878,7 @@ const SB = (function(){
   let _lastError = '';
   let _syncLog = [];
   let _channels = []; // realtime subscriptions
+  const _pendingFetches = new Map(); // debounce: key = "type_year_month"
 
   const CFG_KEY = 'sbConfig';
   const DEFAULT_CFG = {
@@ -897,6 +903,21 @@ const SB = (function(){
     _syncLog = _syncLog.slice(0,50);
   }
 
+  // ---- Debounced fetch: mencegah concurrent fetchPeriod dari Realtime events ----
+  // Masalah: pushPeriod (delete + insert chunks) menghasilkan banyak Realtime events
+  // sekaligus untuk periode yang sama, menyebabkan concurrent HTTP request yang
+  // dapat memotong respons JSON di tengah jalan (SyntaxError position 67584).
+  // Solusi: tunda fetch 1500ms dan lewati jika sudah ada yang antri untuk key yang sama.
+  function scheduleFetch(type, year, month){
+    const key = `${type}_${year}_${month}`;
+    if(_pendingFetches.has(key)) return; // sudah antri, abaikan event duplikat
+    _pendingFetches.set(key, setTimeout(async ()=>{
+      _pendingFetches.delete(key);
+      await fetchPeriod(type, year, month);
+      try{ re(); }catch(e){}
+    }, 1500));
+  }
+
   // ---- Realtime: pull satu periode dari Supabase ke lokal ----
   async function fetchPeriod(type, year, month){
     if(!_client) return;
@@ -913,6 +934,23 @@ const SB = (function(){
         from+=pageSize;
       }
       const rows = allRows.map(r=>{ const {id,year:_y,month:_m,...rest}=r; return rest; });
+
+      // Bug 3 guard: jangan overwrite data lokal yang ada dengan hasil kosong
+      // Ini bisa terjadi saat fetchPeriod dipanggil di tengah pushPeriod (delete selesai,
+      // insert belum selesai) — Supabase mengembalikan 0 rows sementara.
+      // Solusi: kalau hasil fetch kosong, cek dulu apakah data lokal sudah ada.
+      // Hanya overwrite jika hasil fetch punya data, ATAU data lokal memang kosong.
+      if(rows.length===0){
+        let localRows=[];
+        if(type==='sales') localRows=Store.getSales(year,month);
+        else if(type==='budget') localRows=Store.getBudget(year,month);
+        else if(type==='damage') localRows=Store.getDamage(year,month);
+        if(localRows&&localRows.length>0){
+          addLog(`⚠ Fetch ${type} ${MONTHS[month-1]} ${year} kembali 0 rows — data lokal (${localRows.length} rows) dipertahankan`, false);
+          return 0; // jangan overwrite, kembalikan 0
+        }
+      }
+
       if(type==='sales') Store.setSales(year,month,rows);
       else if(type==='budget') Store.setBudget(year,month,rows);
       else if(type==='damage') Store.setDamage(year,month,rows);
@@ -929,31 +967,43 @@ const SB = (function(){
     const tables = ['hm_sales','hm_budget','hm_damage'];
     tables.forEach(table=>{
       const type = table.replace('hm_','');
+      // Bug 4 fix: gunakan satu handler per event type (INSERT & DELETE saja).
+      // UPDATE tidak digunakan karena pushPeriod selalu delete+insert, bukan update.
+      // Ini mencegah ratusan event per-row dari satu INSERT chunk besar
+      // memicu scheduleFetch berkali-kali untuk periode yang sama.
+      // scheduleFetch tetap menjadi lapisan kedua deduplikasi (debounce 1.5s).
+      const handleChange = (payload)=>{
+        const year = payload.new?.year || payload.old?.year;
+        const month = payload.new?.month || payload.old?.month;
+        if(!year||!month) return;
+        addLog(`🔄 Realtime: update ${type} ${MONTHS[month-1]} ${year}`);
+        scheduleFetch(type, year, month);
+      };
       const ch = _client
         .channel(`realtime-${table}`)
-        .on('postgres_changes',
-          { event: '*', schema: 'public', table },
-          async (payload)=>{
-            // Ada perubahan di Supabase — fetch periode yang berubah
-            const year = payload.new?.year || payload.old?.year;
-            const month = payload.new?.month || payload.old?.month;
-            if(!year||!month) return;
-            addLog(`🔄 Realtime: update ${type} ${MONTHS[month-1]} ${year}`);
-            await fetchPeriod(type, year, month);
-            // Re-render app
-            try{ re(); }catch(e){}
-          }
-        )
+        .on('postgres_changes', { event: 'INSERT', schema: 'public', table }, handleChange)
+        .on('postgres_changes', { event: 'DELETE', schema: 'public', table }, handleChange)
         .subscribe(status=>{
-          if(status==='SUBSCRIBED') addLog(`📡 Realtime aktif: ${table}`);
-          else if(status==='CHANNEL_ERROR') addLog(`⚠ Realtime error: ${table}`, false);
+          if(status==='SUBSCRIBED'){
+            addLog(`📡 Realtime aktif: ${table}`);
+          } else if(status==='CHANNEL_ERROR'||status==='TIMED_OUT'||status==='CLOSED'){
+            addLog(`⚠ Realtime terputus: ${table} — akan reconnect saat online`, false);
+            // Jadwalkan pullAll saat channel error agar data tidak tertinggal
+            _scheduleReconnectPull();
+          }
         });
       _channels.push(ch);
     });
   }
 
   // ---- Init koneksi ----
+  let _initLock = false; // Bug 5: cegah concurrent init() — misal autoInit + tombol Hubungkan bersamaan
   async function init(url, key){
+    if(_initLock){
+      addLog('⚠ Koneksi sedang diproses, harap tunggu...', false);
+      return {ok:false, err:'Init sedang berjalan'};
+    }
+    _initLock = true;
     try{
       if(!window.supabase) throw new Error('Supabase SDK belum dimuat.');
       _status='connecting';
@@ -976,6 +1026,8 @@ const SB = (function(){
       _status='error'; _lastError=e.message;
       addLog('❌ Koneksi gagal: '+e.message, false);
       return {ok:false, err:e.message};
+    }finally{
+      _initLock = false; // selalu lepas lock setelah selesai
     }
   }
 
@@ -1031,13 +1083,121 @@ const SB = (function(){
     try{ re(); }catch(e){}
   }
 
+  // ---- Pull satu periode spesifik dari Supabase ke lokal ----
+  // Fungsi ini diperlukan oleh UI tombol "Pull" (SB.pullPeriod).
+  // Sebelumnya tidak ada sehingga tombol Pull selalu gagal dengan
+  // TypeError: SB.pullPeriod is not a function.
+  async function pullPeriod(type, year, month){
+    if(!_client||_status!=='connected')
+      return {ok:false, err:'Tidak terhubung ke Supabase'};
+    try{
+      addLog(`⏳ Pull ${type} ${MONTHS[month-1]} ${year}...`);
+      const count = await fetchPeriod(type, year, month);
+      addLog(`✅ Pull ${type} ${MONTHS[month-1]} ${year}: ${count} rows`);
+      try{ re(); }catch(e){}
+      return {ok:true, count};
+    }catch(e){
+      addLog(`❌ Pull ${type} ${month}/${year} gagal: ${e.message}`, false);
+      return {ok:false, err:e.message};
+    }
+  }
+
+  // ---- Periksa apakah tabel Supabase sudah dibuat ----
+  // Dipanggil setelah connect untuk memberi peringatan jika tabel belum ada.
+  // Hanya melakukan SELECT read-only, tidak membuat atau mengubah tabel.
+  async function ensureTables(){
+    if(!_client) return [];
+    const tables=['hm_sales','hm_budget','hm_damage'];
+    const missing=[];
+    for(const tbl of tables){
+      try{
+        const {error}=await _client.from(tbl).select('id').limit(1);
+        // PGRST204 = table not found, 42P01 = undefined_table
+        if(error && (error.code==='PGRST204'||error.code==='42P01'||
+           (error.message&&error.message.toLowerCase().includes('does not exist')))){
+          missing.push(tbl);
+        }
+      }catch(e){ missing.push(tbl); }
+    }
+    if(missing.length){
+      addLog(`⚠ Tabel belum ada: ${missing.join(', ')} — jalankan SQL Script`, false);
+    }
+    return missing;
+  }
+
+  // ---- Auto pull setelah reconnect (online / channel error) ----
+  // Mencegah data tertinggal saat device offline lalu online kembali.
+  // Debounced 3 detik agar tidak langsung pull saat koneksi masih fluktuatif.
+  let _reconnectTimer = null;
+  function _scheduleReconnectPull(){
+    if(_reconnectTimer) clearTimeout(_reconnectTimer);
+    _reconnectTimer = setTimeout(async ()=>{
+      _reconnectTimer = null;
+      if(_status !== 'connected' || !_client) return;
+      addLog('🔄 Reconnect: sinkronisasi ulang data dari Supabase...');
+      // Re-subscribe Realtime agar channel aktif kembali
+      subscribeRealtime();
+      await pullAll();
+      try{ re(); }catch(e){}
+    }, 3000);
+  }
+
+  // ---- Listener: device kembali online ----
+  // Saat browser/tab kembali dari offline, Realtime WebSocket
+  // tidak mengirim ulang event yang terlewat — harus pull manual.
+  if(typeof window !== 'undefined'){
+    window.addEventListener('online', ()=>{
+      addLog('🌐 Koneksi internet pulih — sinkronisasi ulang...');
+      _scheduleReconnectPull();
+    });
+    // visibilitychange: saat tab/app kembali aktif setelah lama di background
+    document.addEventListener('visibilitychange', ()=>{
+      if(document.visibilityState === 'visible' && _status === 'connected'){
+        addLog('👁 App aktif kembali — memeriksa data terbaru...');
+        _scheduleReconnectPull();
+      }
+    });
+  }
+
   // ---- Auto-init saat app buka — tunggu IndexedDB siap ----
+  // DEFAULT_CFG sudah berisi URL & Key sehingga device baru pun langsung
+  // auto-connect tanpa perlu isi manual di Settings.
   onStorageReady(async function autoInit(){
     const cfg=loadCfg();
     if(!cfg||!cfg.url||!cfg.key) return;
+    // Simpan cfg ke state UI agar input fields terisi & badge update
+    try{
+      if(typeof S!=='undefined'&&S.settings&&S.settings.sb){
+        S.settings.sb.url=cfg.url;
+        S.settings.sb.key=cfg.key;
+        S.settings.sb.msg='⏳ Menghubungkan ke Supabase...';
+        S.settings.sb.msgOk=false;
+      }
+    }catch(e){}
+    try{ re(); }catch(e){}
     await init(cfg.url,cfg.key);
     if(_status==='connected'){
+      try{
+        if(typeof S!=='undefined'&&S.settings&&S.settings.sb){
+          S.settings.sb.msg='⏳ Mengunduh data dari Supabase...';
+          S.settings.sb.msgOk=true;
+        }
+      }catch(e){}
+      try{ re(); }catch(e){}
       await pullAll(); // pull semua data terbaru dari Supabase
+      try{
+        if(typeof S!=='undefined'&&S.settings&&S.settings.sb){
+          S.settings.sb.msg='✅ Terhubung & data berhasil diunduh.';
+          S.settings.sb.msgOk=true;
+        }
+      }catch(e){}
+    } else {
+      try{
+        if(typeof S!=='undefined'&&S.settings&&S.settings.sb){
+          S.settings.sb.msg='❌ Auto-connect gagal: '+_lastError;
+          S.settings.sb.msgOk=false;
+        }
+      }catch(e){}
     }
     try{ re(); }catch(e){}
   });
@@ -1045,7 +1205,8 @@ const SB = (function(){
   return {
     init, clearCfg,
     pushPeriod,
-    pullAll, fetchPeriod,
+    pullAll, pullPeriod, fetchPeriod,
+    ensureTables,
     getStatus:()=>_status,
     getLastError:()=>_lastError,
     getLog:()=>_syncLog,
@@ -1258,9 +1419,9 @@ function sidebarHtml(mobile=false){
       ${GRPS.map(g=>`
         <div class="nlbl">${g.l}</div>
         ${NAV.filter(n=>n.grp===g.k).map(n=>`
-          <div class="ni${S.page===n.id?' on':''}" data-nav="${n.id}">
+          <div class="ni${S.page===n.id?' on':''}" data-nav="${n.id}" title="${esc(n.lbl)}">
             ${ico(n.id.replace('history','history').replace('departments','departments'))||ico('settings')}
-            ${n.lbl}
+            <span>${esc(n.lbl)}</span>
           </div>`).join('')}
       `).join('')}
     </div>
@@ -3911,10 +4072,16 @@ function bind(){
       const r=await SB.init(url,key);
       S.settings.sb.url=url;S.settings.sb.key=key;
       if(r.ok){
-        S.settings.sb.msg='✅ Berhasil terhubung ke Supabase!';S.settings.sb.msgOk=true;
+        S.settings.sb.msg='✅ Terhubung! ⏳ Mengunduh data dari Supabase...';S.settings.sb.msgOk=true;re();
         // Check/warn about missing tables
         const missing=await SB.ensureTables();
-        if(missing&&missing.length) S.settings.sb.msg=`✅ Terhubung! ⚠ Tabel belum dibuat: ${missing.join(', ')} — jalankan SQL Script di atas.`;
+        if(missing&&missing.length){
+          S.settings.sb.msg=`✅ Terhubung! ⚠ Tabel belum dibuat: ${missing.join(', ')} — jalankan SQL Script di atas.`;
+        } else {
+          // Otomatis pull semua data setelah connect berhasil
+          await SB.pullAll();
+          S.settings.sb.msg='✅ Terhubung ke Supabase & data berhasil diunduh.';S.settings.sb.msgOk=true;
+        }
       } else {
         S.settings.sb.msg='❌ Gagal: '+r.err;S.settings.sb.msgOk=false;
       }
