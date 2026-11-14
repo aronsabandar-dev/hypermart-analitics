@@ -518,7 +518,7 @@ break;case"<bookViews":;case"<bookViews>":;case"</bookViews>":break;case"<workbo
 <script>
 // ============================================================
 // PURE VANILLA JS — NO EXTERNAL DEPENDENCIES
-// Build: 20261009-IndexedDB — v5.0.0 (Large Storage, Backup & Restore)
+// Build: 20261114-SupabaseOnly — v6.0.0 (Supabase-first, No IndexedDB, Cross-device Sync)
 // Works 100% offline after initial page load
 // ============================================================
 
@@ -576,174 +576,56 @@ function pl(y,m){return`${MONTHS[m-1]} ${y}`;}
 function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 
 // ============================================================
-// STORAGE ENGINE v5 — IndexedDB (kapasitas besar, aman)
-// Strategi: In-memory cache (sinkron) + IndexedDB (persisten, async)
-// Semua operasi Store tetap sinkron via cache, IndexedDB di-update di background
+// STORAGE ENGINE v6 — Supabase-first, Pure In-Memory Cache
+// Strategi: Supabase = satu-satunya sumber kebenaran (source of truth)
+// In-memory _cache = working copy selama session (tidak ada IndexedDB)
+// Non-data keys (user, theme, dll) tetap pakai localStorage (kecil & aman)
 // ============================================================
 
-// --- In-memory cache (sinkron, selalu tersedia) ---
+// --- In-memory cache untuk DATA (sales/budget/damage) ---
 const _cache = {};
 
-// --- IndexedDB engine ---
-const IDB = (function(){
-  const DB_NAME = 'HypermartDB';
-  const DB_VER  = 1;
-  const STORE   = 'kv';
-  let _db = null;
-  let _ready = false;
-  let _queue = [];
-
-  function open(){
-    return new Promise((res,rej)=>{
-      const req = indexedDB.open(DB_NAME, DB_VER);
-      req.onupgradeneeded = e=>{
-        const db = e.target.result;
-        if(!db.objectStoreNames.contains(STORE)) db.createObjectStore(STORE);
-      };
-      req.onsuccess = e=>{ _db=e.target.result; _ready=true; _flushQueue(); res(_db); };
-      req.onerror  = e=>{ console.warn('IDB open error',e); rej(e); };
-    });
+// --- DB adapter: hanya untuk non-data keys via localStorage ---
+// (theme, navState, user session, auth log, users)
+const DB = {
+  g: k=>{
+    try{ const v=localStorage.getItem('hm_'+k); return v!==null?JSON.parse(v):null; }catch(e){return null;}
+  },
+  s: (k,v)=>{
+    try{ localStorage.setItem('hm_'+k, JSON.stringify(v)); }catch(e){}
+  },
+  d: k=>{
+    try{ localStorage.removeItem('hm_'+k); }catch(e){}
   }
+};
 
-  function _flushQueue(){
-    while(_queue.length){ const fn=_queue.shift(); try{fn(_db);}catch(e){} }
-  }
-
-  function _withDB(fn){
-    if(_ready && _db) { try{fn(_db);}catch(e){} }
-    else _queue.push(fn);
-  }
-
-  function get(k){
-    return new Promise(res=>{
-      _withDB(db=>{
-        const tx = db.transaction(STORE,'readonly');
-        const req = tx.objectStore(STORE).get('hm_'+k);
-        req.onsuccess = ()=>res(req.result!==undefined ? req.result : null);
-        req.onerror   = ()=>res(null);
-      });
-    });
-  }
-
-  function set(k,v){
-    _withDB(db=>{
-      try{
-        const tx = db.transaction(STORE,'readwrite');
-        tx.objectStore(STORE).put(v,'hm_'+k);
-      }catch(e){}
-    });
-  }
-
-  function del(k){
-    _withDB(db=>{
-      try{
-        const tx = db.transaction(STORE,'readwrite');
-        tx.objectStore(STORE).delete('hm_'+k);
-      }catch(e){}
-    });
-  }
-
-  function getAllKeys(){
-    return new Promise(res=>{
-      _withDB(db=>{
-        const tx = db.transaction(STORE,'readonly');
-        const req = tx.objectStore(STORE).getAllKeys();
-        req.onsuccess = ()=>res((req.result||[]).filter(k=>String(k).startsWith('hm_')).map(k=>String(k).slice(3)));
-        req.onerror   = ()=>res([]);
-      });
-    });
-  }
-
-  function clear(excludeKeys){
-    return new Promise(res=>{
-      _withDB(db=>{
-        const tx = db.transaction(STORE,'readwrite');
-        const store = tx.objectStore(STORE);
-        const req = store.getAllKeys();
-        req.onsuccess = ()=>{
-          (req.result||[]).forEach(k=>{
-            const plain = String(k).startsWith('hm_') ? String(k).slice(3) : k;
-            if(!excludeKeys.includes(plain)) store.delete(k);
-          });
-          res();
-        };
-        req.onerror = ()=>res();
-      });
-    });
-  }
-
-  // Export semua data sebagai JSON
-  function exportAll(){
-    return new Promise(res=>{
-      _withDB(db=>{
-        const tx = db.transaction(STORE,'readonly');
-        const req = tx.objectStore(STORE).getAll();
-        const kreq = tx.objectStore(STORE).getAllKeys();
-        let vals=null, keys=null;
-        kreq.onsuccess = ()=>{ keys=kreq.result; if(vals!==null) res({keys,vals}); };
-        req.onsuccess  = ()=>{ vals=req.result;  if(keys!==null) res({keys,vals}); };
-        req.onerror    = ()=>res({keys:[],vals:[]});
-      });
-    });
-  }
-
-  // Import dari JSON backup
-  function importAll(entries){
-    return new Promise(res=>{
-      _withDB(db=>{
-        const tx = db.transaction(STORE,'readwrite');
-        const store = tx.objectStore(STORE);
-        entries.forEach(([k,v])=>{ try{store.put(v,k);}catch(e){} });
-        tx.oncomplete = ()=>res(true);
-        tx.onerror    = ()=>res(false);
-      });
-    });
-  }
-
-  open().catch(e=>console.warn('IndexedDB tidak tersedia, data tidak akan tersimpan permanen.',e));
-
-  return {get,set,del,getAllKeys,clear,exportAll,importAll,isReady:()=>_ready};
-})();
-
-// --- Inisialisasi cache dari IndexedDB saat startup ---
+// onStorageReady: langsung ready karena tidak ada async IDB init
 let _storageReady = false;
 let _storageReadyCallbacks = [];
-
 function onStorageReady(fn){ if(_storageReady){fn();}else{_storageReadyCallbacks.push(fn);} }
-
-(async function initCache(){
-  try {
-    const keys = await IDB.getAllKeys();
-    for(const k of keys){
-      const v = await IDB.get(k);
-      if(v !== null) _cache[k] = v;
-    }
-  } catch(e){ console.warn('Cache init error:',e); }
+// Fire immediately — no async storage to wait for
+setTimeout(()=>{
   _storageReady = true;
   _storageReadyCallbacks.forEach(fn=>{ try{fn();}catch(e){} });
   _storageReadyCallbacks = [];
-  // Re-render setelah storage siap (untuk memastikan data tampil)
-  if(typeof re === 'function') { try{re();}catch(e){} }
-})();
-
-// --- DB adapter (sinkron via cache + async persist ke IndexedDB) ---
-const DB = {
-  g: k=>{ const v=_cache[k]; return v!==undefined ? v : null; },
-  s: (k,v)=>{ _cache[k]=v; IDB.set(k,v); },
-  d: k=>{ delete _cache[k]; IDB.del(k); }
-};
+}, 0);
 
 // ---- STORE ----
+// DATA (sales/budget/damage) → in-memory _cache ONLY (Supabase adalah master)
+// NON-DATA (user, users, theme, log) → localStorage via DB adapter
 const Store={
-  getSales:(y,m)=>DB.g(`s${y}_${m}`)||[],setSales:(y,m,d)=>DB.s(`s${y}_${m}`,d),
-  getBudget:(y,m)=>DB.g(`b${y}_${m}`)||[],setBudget:(y,m,d)=>DB.s(`b${y}_${m}`,d),
-  getDamage:(y,m)=>DB.g(`d${y}_${m}`)||[],setDamage:(y,m,d)=>DB.s(`d${y}_${m}`,d),
+  getSales:(y,m)=>_cache[`s${y}_${m}`]||[],
+  setSales:(y,m,d)=>{ _cache[`s${y}_${m}`]=d; },
+  getBudget:(y,m)=>_cache[`b${y}_${m}`]||[],
+  setBudget:(y,m,d)=>{ _cache[`b${y}_${m}`]=d; },
+  getDamage:(y,m)=>_cache[`d${y}_${m}`]||[],
+  setDamage:(y,m,d)=>{ _cache[`d${y}_${m}`]=d; },
 
   // Multi-bulan: gabungkan data dari m1 s/d m2, dengan info bulan mana yang kosong
   getSalesRange(y,m1,m2){
     const missing=[];const rows=[];
     for(let m=m1;m<=m2;m++){
-      const d=DB.g(`s${y}_${m}`)||[];
+      const d=_cache[`s${y}_${m}`]||[];
       if(!d.length) missing.push(MONTHS[m-1]);
       else rows.push(...d);
     }
@@ -758,7 +640,7 @@ const Store={
   getBudgetRange(y,m1,m2){
     const missing=[];const budMap={};
     for(let m=m1;m<=m2;m++){
-      const d=DB.g(`b${y}_${m}`)||[];
+      const d=_cache[`b${y}_${m}`]||[];
       if(!d.length) missing.push(MONTHS[m-1]);
       d.forEach(b=>{
         const code=b.department_code;
@@ -770,7 +652,7 @@ const Store={
   getDamageRange(y,m1,m2){
     const rows=[];
     for(let m=m1;m<=m2;m++){
-      const d=DB.g(`d${y}_${m}`)||[];
+      const d=_cache[`d${y}_${m}`]||[];
       rows.push(...d);
     }
     const map={};
@@ -789,22 +671,20 @@ const Store={
   addAuthLog:entry=>{const log=DB.g('authLog')||[];log.unshift(entry);DB.s('authLog',log.slice(0,500));},
   hasDemo:()=>false,setDemo:()=>{},
   clearAll:()=>{
-    const excludeKeys=['usr','users'];
-    // Hapus dari cache
-    Object.keys(_cache).forEach(k=>{ if(!excludeKeys.includes(k)) delete _cache[k]; });
-    // Hapus dari IndexedDB
-    IDB.clear(excludeKeys);
+    // Hapus semua data dari in-memory cache (data di Supabase tidak tersentuh)
+    Object.keys(_cache).forEach(k=>delete _cache[k]);
   },
 
   // ---- BACKUP & RESTORE ----
   async exportBackup(){
-    const {keys,vals} = await IDB.exportAll();
-    const entries = keys.map((k,i)=>[k, vals[i]]);
+    // Baca dari in-memory cache — semua data sales/budget/damage
+    const dataKeys = Object.keys(_cache).filter(k=>/^[sbd]\d{4}_\d+$/.test(k));
+    const entries = dataKeys.map(k=>['hm_'+k, _cache[k]]);
     const data = {
       v:1,
       app:'HypermartAnalytics',
       ts: new Date().toISOString(),
-      entries: entries.filter(([k])=>String(k).startsWith('hm_'))
+      entries
     };
     const blob = new Blob([JSON.stringify(data,null,2)],{type:'application/json'});
     const url = URL.createObjectURL(blob);
@@ -823,16 +703,14 @@ const Store={
           const data = JSON.parse(e.target.result);
           if(data.app!=='HypermartAnalytics') return rej(new Error('File backup tidak valid.'));
           const entries = data.entries||[];
-          // Update cache
+          const typeMap = {s:'sales', b:'budget', d:'damage'};
+          // Tulis ke in-memory cache
           entries.forEach(([k,v])=>{
             const plain = String(k).startsWith('hm_') ? String(k).slice(3) : k;
             _cache[plain] = v;
           });
-          // Persist ke IndexedDB dulu — tunggu selesai
-          await IDB.importAll(entries);
-          // Setelah IndexedDB sukses, push ke Supabase — Realtime notify semua device
+          // Push ke Supabase — ini yang menyinkronkan ke semua device
           if(SB.isConnected()){
-            const typeMap = {s:'sales', b:'budget', d:'damage'};
             for(const [k,v] of entries){
               const plain = String(k).startsWith('hm_') ? String(k).slice(3) : k;
               const match = plain.match(/^([sbd])(\d{4})_(\d+)$/);
@@ -841,6 +719,9 @@ const Store={
                 if(type) await SB.pushPeriod(type, year, month, v);
               }
             }
+          } else {
+            rej(new Error('Tidak terhubung ke Supabase. Hubungkan dulu sebelum import backup.'));
+            return;
           }
           res(entries.length);
         }catch(err){ rej(err); }
@@ -855,18 +736,24 @@ const Store={
     const salesKeys = allKeys.filter(k=>/^s\d{4}_\d+$/.test(k));
     const budgetKeys = allKeys.filter(k=>/^b\d{4}_\d+$/.test(k));
     const damageKeys = allKeys.filter(k=>/^d\d{4}_\d+$/.test(k));
-    const totalRows = salesKeys.reduce((a,k)=>a+(DB.g(k)||[]).length,0)
-      + budgetKeys.reduce((a,k)=>a+(DB.g(k)||[]).length,0)
-      + damageKeys.reduce((a,k)=>a+(DB.g(k)||[]).length,0);
+    const totalRows = salesKeys.reduce((a,k)=>a+(_cache[k]||[]).length,0)
+      + budgetKeys.reduce((a,k)=>a+(_cache[k]||[]).length,0)
+      + damageKeys.reduce((a,k)=>a+(_cache[k]||[]).length,0);
     // Estimasi ukuran cache (JSON)
     let sizeBytes = 0;
     try{ sizeBytes = new TextEncoder().encode(JSON.stringify(_cache)).length; }catch(e){}
-    return { salesKeys:salesKeys.length, budgetKeys:budgetKeys.length, damageKeys:damageKeys.length, totalKeys:allKeys.length, totalRows, sizeBytes, idbReady:IDB.isReady() };
+    return { salesKeys:salesKeys.length, budgetKeys:budgetKeys.length, damageKeys:damageKeys.length, totalKeys:allKeys.length, totalRows, sizeBytes, idbReady:true };
   }
 };
 if(Store.getUsers().length===0)Store.setUsers([{id:'1',email:'admin@hypermart.co.id',password:'Admin123!',name:'Aron Admin',role:'admin'}]);
 
 // (Demo data dihapus — hanya data real yang di-upload yang akan tampil)
+
+// ============================================================
+// GLOBAL APP LOADING STATE — ditampilkan saat Supabase pull saat startup
+// ============================================================
+let _appLoading = true; // true saat pertama buka, sampai pullAll selesai
+let _appLoadMsg = '⏳ Menghubungkan ke Supabase...';
 
 // ============================================================
 // SUPABASE INTEGRATION ENGINE v2 — Realtime
@@ -1212,48 +1099,66 @@ const SB = (function(){
     });
   }
 
-  // ---- Auto-init saat app buka — tunggu IndexedDB siap ----
-  // DEFAULT_CFG sudah berisi URL & Key sehingga device baru pun langsung
-  // auto-connect tanpa perlu isi manual di Settings.
-  onStorageReady(async function autoInit(){
+  // ---- Auto-init saat app buka — langsung tanpa tunggu IndexedDB ----
+  // Supabase adalah satu-satunya storage. Semua device auto-connect & pull data.
+  async function autoInit(){
     const cfg=loadCfg();
-    if(!cfg||!cfg.url||!cfg.key) return;
-    // Simpan cfg ke state UI agar input fields terisi & badge update
-    try{
-      if(typeof S!=='undefined'&&S.settings&&S.settings.sb){
-        S.settings.sb.url=cfg.url;
-        S.settings.sb.key=cfg.key;
-        S.settings.sb.msg='⏳ Menghubungkan ke Supabase...';
-        S.settings.sb.msgOk=false;
-      }
-    }catch(e){}
-    try{ re(); }catch(e){}
-    await init(cfg.url,cfg.key);
-    if(_status==='connected'){
-      try{
-        if(typeof S!=='undefined'&&S.settings&&S.settings.sb){
-          S.settings.sb.msg='⏳ Mengunduh data dari Supabase...';
-          S.settings.sb.msgOk=true;
-        }
-      }catch(e){}
+    if(!cfg||!cfg.url||!cfg.key){
+      _appLoading=false;
       try{ re(); }catch(e){}
-      await pullAll(); // pull semua data terbaru dari Supabase
+      return;
+    }
+    _appLoading=true;
+    _appLoadMsg='⏳ Menghubungkan ke Supabase...';
+    try{ re(); }catch(e){}
+
+    await init(cfg.url,cfg.key);
+
+    if(_status==='connected'){
+      _appLoadMsg='⏳ Mengunduh data dari Supabase...';
+      try{ re(); }catch(e){}
+      await pullAll();
+      _appLoading=false;
+      _appLoadMsg='';
+      // Re-apply default period setelah data loaded agar dashboard langsung ke periode terbaru
+      try{
+        const dp2=defPeriod();
+        S.dash.year=dp2.y;S.dash.month=dp2.m;S.dash.monthEnd=dp2.m;
+        S.sales.year=dp2.y;S.sales.month=dp2.m;
+        S.neg.year=dp2.y;S.neg.month=dp2.m;
+        S.dmg.year=dp2.y;S.dmg.month=dp2.m;
+        S.sku.year=dp2.y;S.sku.month=dp2.m;
+        S.upload.year=dp2.y;S.upload.month=dp2.m;
+        S.dept.year=dp2.y;S.dept.month=dp2.m;
+        S.cat.year=dp2.y;S.cat.month=dp2.m;
+        S.budg.year=dp2.y;S.budg.month=dp2.m;
+        S.rep.year=dp2.y;S.rep.month=dp2.m;
+        // Restore nav state dari localStorage (halaman terakhir yang dibuka)
+        restoreNavState();
+      }catch(e){}
       try{
         if(typeof S!=='undefined'&&S.settings&&S.settings.sb){
           S.settings.sb.msg='✅ Terhubung & data berhasil diunduh.';
           S.settings.sb.msgOk=true;
+          S.settings.sb.url=cfg.url;
+          S.settings.sb.key=cfg.key;
         }
       }catch(e){}
     } else {
+      _appLoading=false;
+      _appLoadMsg='';
       try{
         if(typeof S!=='undefined'&&S.settings&&S.settings.sb){
-          S.settings.sb.msg='❌ Auto-connect gagal: '+_lastError;
+          S.settings.sb.msg='❌ Gagal terhubung: '+_lastError;
           S.settings.sb.msgOk=false;
         }
       }catch(e){}
     }
     try{ re(); }catch(e){}
-  });
+  }
+
+  // Jalankan autoInit segera setelah script ini dieksekusi
+  setTimeout(autoInit, 0);
 
   return {
     init, clearCfg,
@@ -1266,6 +1171,8 @@ const SB = (function(){
     getClient:()=>_client,
     getCfg:()=>_cfg,
     isConnected:()=>_status==='connected',
+    isAppLoading:()=>_appLoading,
+    getAppLoadMsg:()=>_appLoadMsg,
   };
 })();
 
@@ -1273,7 +1180,7 @@ const SB = (function(){
 const S={
   user:Store.getUser(),
   theme: DB.g('theme')||'light',
-  sidebarCollapsed: DB.g('sidebarCollapsed')==='1',
+  sidebarCollapsed: DB.g('sidebarCollapsed')===true||DB.g('sidebarCollapsed')==='1',
   page:'dashboard',
   dash:{year:0,month:0,monthEnd:0,rangeMode:false,scope:'store',dept:'',cat:''},
   sales:{year:0,month:0,dept:'all',q:'',sort:'sales',dir:-1,pg:1,view:'all'},
@@ -1372,10 +1279,9 @@ function restoreNavState(){
   }catch(e){}
 }
 
-// Pulihkan state setelah IndexedDB siap (cache sudah load)
-onStorageReady(function(){
-  restoreNavState();
-});
+// restoreNavState dipanggil setelah pullAll() selesai (di dalam autoInit)
+// Tidak perlu onStorageReady karena localStorage langsung tersedia
+restoreNavState();
 
 // ---- RENDER ENGINE ----
 function h(tag,attrs={},inner=''){
@@ -1388,13 +1294,28 @@ function applyTheme(){
   if(mc)mc.content=S.theme==='light'?'#ffffff':'#0f172a';
 }
 function re(){
+  applyTheme();
+  const root=document.getElementById('app');
+  if(!root) return;
+
+  // Tampilkan loading screen saat Supabase belum selesai pull data awal
+  if(_appLoading){
+    root.innerHTML=`
+      <div style="min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:20px;background:var(--bgc)">
+        <div style="font-size:36px">📊</div>
+        <div style="font-weight:800;font-size:18px;color:var(--t1)">HM284 Analytics</div>
+        <div class="spin" style="width:36px;height:36px"></div>
+        <div style="font-size:13px;color:var(--t2);text-align:center;max-width:280px;line-height:1.6">${esc(_appLoadMsg)}</div>
+        <div style="font-size:11px;color:var(--tm)">Hypermart 284 Ambon City Center</div>
+      </div>`;
+    return;
+  }
+
   // Simpan state navigasi saat ini sebelum render ulang
   saveNavState();
   // Destroy all Chart.js instances before innerHTML replacement
   Object.keys(_chartInstances).forEach(k=>_destroyChart(k));
-  applyTheme();
-  const root=document.getElementById('app');
-  if(root)root.innerHTML=render();
+  root.innerHTML=render();
   bind();
 }
 
@@ -3158,24 +3079,22 @@ function pageSettings(){
       return`
       <div class="grid2" style="margin-bottom:16px">
         <div class="panel">
-          <div class="ph"><div class="ptl">💾 Storage Engine — IndexedDB</div><span class="badge bg">Kapasitas Besar</span></div>
-          <div class="srow"><span class="sl">Engine penyimpanan</span><span class="sv"><span class="badge bg">IndexedDB (aman & besar)</span></span></div>
-          <div class="srow"><span class="sl">Status IndexedDB</span><span class="sv"><span class="badge ${si.idbReady?'bg':'by'}">${si.idbReady?'✓ Aktif':'⏳ Inisialisasi...'}</span></span></div>
-          <div class="srow"><span class="sl">Kapasitas tersedia</span><span class="sv" style="color:var(--green);font-weight:700">Ratusan MB – beberapa GB</span></div>
-          <div class="srow"><span class="sl">Data dalam cache (estimasi)</span><span class="sv">${sizeMB} MB</span></div>
-          <div class="srow"><span class="sl">Total keys tersimpan</span><span class="sv">${si.totalKeys.toLocaleString('id')}</span></div>
-          <div class="srow"><span class="sl">Periode sales</span><span class="sv">${si.salesKeys}</span></div>
-          <div class="srow"><span class="sl">Periode budget</span><span class="sv">${si.budgetKeys}</span></div>
-          <div class="srow"><span class="sl">Periode damage</span><span class="sv">${si.damageKeys}</span></div>
-          <div class="srow"><span class="sl">Total baris data</span><span class="sv">${si.totalRows.toLocaleString('id')}</span></div>
+          <div class="ph"><div class="ptl">☁ Storage Engine — Supabase Cloud</div><span class="badge bg">Sinkron Semua Device</span></div>
+          <div class="srow"><span class="sl">Engine penyimpanan</span><span class="sv"><span class="badge bg">Supabase (Cloud Database)</span></span></div>
+          <div class="srow"><span class="sl">Status koneksi</span><span class="sv"><span class="badge ${SB.isConnected()?'bg':'br'}">${SB.isConnected()?'✓ Terhubung':'✗ Terputus'}</span></span></div>
+          <div class="srow"><span class="sl">In-memory cache (sesi ini)</span><span class="sv">${sizeMB} MB</span></div>
+          <div class="srow"><span class="sl">Periode sales di cache</span><span class="sv">${si.salesKeys}</span></div>
+          <div class="srow"><span class="sl">Periode budget di cache</span><span class="sv">${si.budgetKeys}</span></div>
+          <div class="srow"><span class="sl">Periode damage di cache</span><span class="sv">${si.damageKeys}</span></div>
+          <div class="srow"><span class="sl">Total baris di cache</span><span class="sv">${si.totalRows.toLocaleString('id')}</span></div>
           <div class="srow"><span class="sl">Upload sessions</span><span class="sv">${Store.getSess().length}</span></div>
           <hr class="divider" style="margin:0 20px"/>
           <div style="padding:16px 20px">
-            <div class="fl" style="margin-bottom:8px">Hapus Semua Data</div>
-            <div style="font-size:12px;color:var(--tm);margin-bottom:10px">Hapus semua data yang telah di-upload (sales, budget, damage). Akun pengguna tetap tersimpan.</div>
+            <div class="fl" style="margin-bottom:8px">Hapus Cache Lokal (Reload Data)</div>
+            <div style="font-size:12px;color:var(--tm);margin-bottom:10px">Hapus cache sesi ini dan reload data dari Supabase. Data di Supabase <strong>tidak</strong> terhapus.</div>
             <div style="display:flex;gap:8px;align-items:center">
               <input class="inp" style="max-width:120px" placeholder='Ketik "RESET"' id="confReset" value="${esc(conf)}"/>
-              <button class="btn btn-d btn-sm" id="doReset">Reset</button>
+              <button class="btn btn-d btn-sm" id="doReset">Reset Cache</button>
             </div>
           </div>
         </div>
@@ -3184,13 +3103,13 @@ function pageSettings(){
           <div style="padding:16px 20px">
             <div style="margin-bottom:18px">
               <div class="fl" style="margin-bottom:6px">Export Backup</div>
-              <div style="font-size:12px;color:var(--tm);margin-bottom:10px">Unduh semua data (sales, budget, damage, pengaturan) ke file JSON. Simpan sebagai cadangan aman.</div>
+              <div style="font-size:12px;color:var(--tm);margin-bottom:10px">Unduh semua data dari cache sesi ini ke file JSON sebagai cadangan offline.</div>
               <button class="btn btn-p" id="doExportBackup">⬇ Download Backup (.json)</button>
             </div>
             <hr class="divider"/>
             <div style="margin-bottom:18px">
               <div class="fl" style="margin-bottom:6px">Import / Restore Backup</div>
-              <div style="font-size:12px;color:var(--tm);margin-bottom:10px">Pulihkan data dari file backup. <strong style="color:var(--red)">Perhatian: data saat ini akan ditimpa oleh data backup.</strong></div>
+              <div style="font-size:12px;color:var(--tm);margin-bottom:10px">Pulihkan data dari file backup ke Supabase. <strong style="color:var(--red)">Data lama di Supabase untuk periode yang sama akan ditimpa.</strong></div>
               <div id="backupImportMsg" style="display:none;font-size:12px;margin-bottom:8px"></div>
               <button class="btn btn-s" id="doImportBackup">⬆ Pilih File Backup (.json)</button>
               <input type="file" id="backupFileInput" accept=".json" style="display:none"/>
@@ -3199,9 +3118,9 @@ function pageSettings(){
             <div>
               <div class="fl" style="margin-bottom:6px">Cara Kerja Storage</div>
               <div style="font-size:12px;color:var(--tm);line-height:1.6">
-                ✅ Data disimpan di <strong>IndexedDB</strong> browser — jauh lebih besar dari localStorage (5 MB) dan tetap aman setelah browser ditutup.<br/>
-                ✅ Tersimpan otomatis — tidak perlu klik "Save".<br/>
-                ✅ Gunakan fitur Backup untuk menjaga data agar tidak hilang saat clear cache browser.
+                ☁ Data tersimpan di <strong>Supabase Cloud</strong> — semua perangkat yang buka link yang sama akan melihat data yang identik.<br/>
+                ✅ Upload di PC otomatis tersinkron ke HP, tablet, dan browser lain.<br/>
+                ⚡ Cache in-memory digunakan selama sesi untuk performa render cepat.
               </div>
             </div>
           </div>
@@ -3210,7 +3129,7 @@ function pageSettings(){
       <div class="panel" style="margin-bottom:0">
         <div class="ph"><div class="ptl">Data Flow</div></div>
         <div class="flow">
-          ${['SALES / BUDGET / DAMAGE EXCEL','FILE VALIDATION','DUPLICATE SKU AGGREGATION','PERIOD REPLACEMENT (ATOMIC)','IndexedDB (Browser, Besar & Aman)','TY / LY ENGINE','ANALYTICS DASHBOARD'].map((n,i,a)=>`
+          ${['SALES / BUDGET / DAMAGE EXCEL','FILE VALIDATION','DUPLICATE SKU AGGREGATION','PERIOD REPLACEMENT (ATOMIC)','☁ SUPABASE CLOUD (Sumber Data Utama)','TY / LY ENGINE','ANALYTICS DASHBOARD'].map((n,i,a)=>`
             <div class="fnode${i===4?' hi':''}">${n}</div>
             ${i<a.length-1?'<div class="farr">↓</div>':''}`).join('')}
         </div>
@@ -3305,7 +3224,7 @@ create policy "allow_all_hm_damage" on hm_damage for all using (true) with check
             ${sbStatus!=='connected'?`<div style="font-size:12px;color:var(--tm);padding:12px;background:var(--bg3);border-radius:6px">⚠ Hubungkan ke Supabase terlebih dahulu untuk melakukan sync.</div>`:`
             <div style="margin-bottom:18px">
               <div class="fl" style="margin-bottom:6px">☁ Push ke Supabase (Upload Lokal → Cloud)</div>
-              <div style="font-size:12px;color:var(--tm);margin-bottom:10px">Kirim data dari IndexedDB lokal ke Supabase. Data lama di Supabase untuk periode tersebut akan diganti.</div>
+              <div style="font-size:12px;color:var(--tm);margin-bottom:10px">Kirim data dari cache sesi ini ke Supabase. Data lama di Supabase untuk periode tersebut akan diganti.</div>
               <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">
                 <select class="sel" id="sbPushType" style="min-width:100px"><option value="sales">Sales</option><option value="budget">Budget</option><option value="damage">Damage</option></select>
                 <select class="sel" id="sbPushYear" style="min-width:80px">${years.map(y=>`<option value="${y}"${y===new Date().getFullYear()?' selected':''}>${y}</option>`).join('')}</select>
@@ -3317,7 +3236,7 @@ create policy "allow_all_hm_damage" on hm_damage for all using (true) with check
             <hr class="divider"/>
             <div style="margin-bottom:18px">
               <div class="fl" style="margin-bottom:6px">⬇ Pull dari Supabase (Cloud → Lokal)</div>
-              <div style="font-size:12px;color:var(--tm);margin-bottom:10px">Ambil data dari Supabase ke IndexedDB lokal. Berguna saat ganti perangkat atau data lokal hilang.</div>
+              <div style="font-size:12px;color:var(--tm);margin-bottom:10px">Ambil ulang data dari Supabase ke cache sesi ini. Berguna jika data tampak tidak sinkron.</div>
               <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">
                 <select class="sel" id="sbPullType" style="min-width:100px"><option value="sales">Sales</option><option value="budget">Budget</option><option value="damage">Damage</option></select>
                 <select class="sel" id="sbPullYear" style="min-width:80px">${years.map(y=>`<option value="${y}"${y===new Date().getFullYear()?' selected':''}>${y}</option>`).join('')}</select>
@@ -3738,7 +3657,7 @@ function bind(){
 
   // Logout
   const scb=document.getElementById('sidebarCollapseBtn');
-  if(scb)scb.onclick=()=>{S.sidebarCollapsed=!S.sidebarCollapsed;DB.s('sidebarCollapsed',S.sidebarCollapsed?'1':'0');re();};
+  if(scb)scb.onclick=()=>{S.sidebarCollapsed=!S.sidebarCollapsed;DB.s('sidebarCollapsed',S.sidebarCollapsed);re();};
   // Category dept filter
   const catDept=document.querySelector('[data-cat-dept]');
   if(catDept)catDept.onchange=()=>{S.cat.dept=catDept.value;re();};
