@@ -1087,20 +1087,27 @@ const SB = (function(){
   async function pullAll(){
     if(!_client||_status!=='connected') return;
     addLog('⏳ Memuat semua data dari Supabase...');
+    // Aktifkan pulling state agar banner loading muncul di mobile
+    try{ if(typeof S!=='undefined'&&S.settings?.sb){ S.settings.sb.pulling=true; re(); } }catch(e){}
     const types=['sales','budget','damage'];
     let total=0;
-    for(const type of types){
-      const {data,error} = await _client.from(`hm_${type}`).select('year,month').order('year').order('month');
-      if(error||!data) continue;
-      const seen=new Set(), periods=[];
-      data.forEach(r=>{ const k=`${r.year}_${r.month}`; if(!seen.has(k)){seen.add(k);periods.push(r);} });
-      for(const {year,month} of periods){
-        const count = await fetchPeriod(type,year,month);
-        total+=count;
+    try{
+      for(const type of types){
+        const {data,error} = await _client.from(`hm_${type}`).select('year,month').order('year').order('month');
+        if(error||!data) continue;
+        const seen=new Set(), periods=[];
+        data.forEach(r=>{ const k=`${r.year}_${r.month}`; if(!seen.has(k)){seen.add(k);periods.push(r);} });
+        for(const {year,month} of periods){
+          const count = await fetchPeriod(type,year,month);
+          total+=count;
+        }
       }
+      addLog(`✅ Selesai memuat: ${total} rows`);
+    }finally{
+      // Pastikan pulling state selalu direset meski ada error
+      try{ if(typeof S!=='undefined'&&S.settings?.sb){ S.settings.sb.pulling=false; } }catch(e){}
+      try{ re(); }catch(e){}
     }
-    addLog(`✅ Selesai memuat: ${total} rows`);
-    try{ re(); }catch(e){}
   }
 
   // ---- Pull satu periode spesifik dari Supabase ke lokal ----
@@ -1423,13 +1430,11 @@ const MNAV=[
   {id:'dashboard',lbl:'Dashboard'},
   {id:'sales',lbl:'Sales'},
   {id:'sku',lbl:'SKU'},
-  {id:'negative',lbl:'Minus'},
   {id:'damage',lbl:'Damage'},
-  {id:'category',lbl:'Category'},
   {id:'budget',lbl:'Budget'},
   {id:'report',lbl:'Report'},
   {id:'upload',lbl:'Upload'},
-  {id:'history',lbl:'History'},
+  {id:'settings',lbl:'Settings'},
 ];
 const GRPS=[{k:'analytics',l:'Analytics'},{k:'data',l:'Data Management'},{k:'system',l:'System'}];
 
@@ -3424,9 +3429,9 @@ function render(){
             <div style="font-size:10px;color:var(--tm)">Latest data: ${pl(dp.y,dp.m)}</div>
           </div>
           <button class="theme-btn" id="themeToggle" title="Toggle light/dark">${S.theme==='dark'?'☀️':'🌙'}</button>
-          <div title="Supabase Cloud Status" onclick="S.page='settings';S.settings.tab='supabase';re();" style="cursor:pointer;display:flex;flex-direction:column;align-items:center;gap:1px;min-width:44px">
-            ${SB.getStatus()==='connecting'
-              ? `<span style="font-size:16px">🔄</span><span style="font-size:9px;color:var(--amber);font-weight:700">Sync...</span>`
+          <div title="Supabase Cloud Status — tap untuk buka pengaturan" onclick="S.page='settings';S.settings.tab='supabase';re();" style="cursor:pointer;display:flex;flex-direction:column;align-items:center;gap:1px;min-width:44px">
+            ${(SB.getStatus()==='connecting'||S.settings.sb.pulling||S.settings.sb.pushing)
+              ? `<span style="font-size:16px;display:inline-block;animation:spin 1s linear infinite">🔄</span><span style="font-size:9px;color:var(--amber);font-weight:700">Sync...</span>`
               : SB.isConnected()
               ? `<span style="font-size:16px">☁️</span><span style="font-size:9px;color:var(--green);font-weight:700">Online</span>`
               : `<span style="font-size:16px">⛅</span><span style="font-size:9px;color:var(--tm);font-weight:600">Offline</span>`
@@ -3434,8 +3439,8 @@ function render(){
           </div>
         </div>
       </div>
-      ${SB.getStatus()==='connecting'
-        ? `<div style="background:rgba(245,158,11,.12);border-bottom:1px solid var(--amber);color:var(--amber);font-size:11px;font-weight:600;padding:7px 16px;text-align:center;letter-spacing:.2px">⏳ Menghubungkan & mengunduh data dari Supabase...</div>`
+      ${(SB.getStatus()==='connecting'||S.settings.sb.pulling)
+        ? `<div style="background:rgba(245,158,11,.12);border-bottom:1px solid var(--amber);color:var(--amber);font-size:11px;font-weight:600;padding:7px 16px;text-align:center;letter-spacing:.2px">⏳ ${SB.getStatus()==='connecting'?'Menghubungkan ke Supabase...':'Mengunduh data dari Supabase...'}</div>`
         : ''
       }
       <div class="page">${pageHtml}</div>
