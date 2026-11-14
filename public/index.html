@@ -79,6 +79,7 @@ input,select{font-family:inherit;border:none;outline:none}
 .sidebar.collapsed ~ .main{margin-left:52px}
 .collapse-btn{width:100%;display:flex;align-items:center;justify-content:flex-end;padding:6px 10px;background:none;border:none;cursor:pointer;color:var(--tm);font-size:14px;border-top:1px solid var(--bd)}
 .sidebar.collapsed .collapse-btn{justify-content:center;padding:6px 0}
+@keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
 /* PDF Overlay */
 .pdf-overlay{display:none;position:fixed;top:0;left:0;right:0;bottom:0;z-index:9999;background:#fff;flex-direction:column}
 .pdf-overlay.show{display:flex}
@@ -927,6 +928,7 @@ const SB = (function(){
       while(true){
         const {data,error} = await _client.from(table)
           .select('*').eq('year',year).eq('month',month)
+          .order('id', {ascending:true})
           .range(from, from+pageSize-1);
         if(error) throw new Error(error.message);
         allRows.push(...(data||[]));
@@ -1040,8 +1042,14 @@ const SB = (function(){
       if(delErr) throw new Error('Delete gagal: '+delErr.message);
       if(!rows||!rows.length){ addLog(`✅ Push ${type} ${month}/${year} — 0 rows`); return {ok:true,count:0}; }
       const CHUNK=500; let total=0;
+      // Masalah 2 fix: simpan data lokal sebagai backup sebelum mulai insert.
+      // Jika insert chunk manapun gagal di tengah jalan, Supabase sudah di-delete
+      // tapi belum terisi penuh → kondisi partial/rusak.
+      // Solusi: jika ada insert yang gagal, langsung coba delete ulang sisa
+      // yang sudah masuk dan lempar error agar caller tahu push tidak berhasil.
+      const chunks = [];
       for(let i=0;i<rows.length;i+=CHUNK){
-        const chunk = rows.slice(i,i+CHUNK).map(r=>({
+        chunks.push(rows.slice(i,i+CHUNK).map(r=>({
           year, month,
           department_code: r.department_code||'',
           sku: String(r.sku||''),
@@ -1050,10 +1058,22 @@ const SB = (function(){
           ...(type==='sales'&&{sales:Number(r.sales||0),qty:Number(r.qty||0)}),
           ...(type==='budget'&&{budget_amount:Number(r.budget_amount||0)}),
           ...(type==='damage'&&{total_cost:Number(r.total_cost||0),qty:Number(r.qty||0)}),
-        }));
-        const {error:insErr} = await _client.from(table).insert(chunk);
-        if(insErr) throw new Error('Insert gagal: '+insErr.message);
-        total+=chunk.length;
+        })));
+      }
+      let insertedChunks=0;
+      try{
+        for(const chunk of chunks){
+          const {error:insErr} = await _client.from(table).insert(chunk);
+          if(insErr) throw new Error('Insert gagal chunk '+(insertedChunks+1)+': '+insErr.message);
+          total+=chunk.length;
+          insertedChunks++;
+        }
+      }catch(insError){
+        // Partial insert terjadi — hapus semua data yang sudah masuk
+        // agar Supabase tidak menyimpan data yang tidak lengkap
+        addLog(`⚠ Push partial — rollback ${type} ${MONTHS[month-1]} ${year}...`, false);
+        await _client.from(table).delete().eq('year',year).eq('month',month);
+        throw insError; // lempar ke outer catch
       }
       addLog(`✅ Push ${type} ${MONTHS[month-1]} ${year} — ${total} rows`);
       return {ok:true, count:total};
@@ -1151,10 +1171,36 @@ const SB = (function(){
       _scheduleReconnectPull();
     });
     // visibilitychange: saat tab/app kembali aktif setelah lama di background
-    document.addEventListener('visibilitychange', ()=>{
+    // Throttle: hanya pull jika terakhir pull lebih dari 5 menit yang lalu
+    // agar tidak membuang bandwidth saat user sering berpindah tab.
+    let _lastPullTime = 0;
+    const PULL_THROTTLE_MS = 5 * 60 * 1000; // 5 menit
+    const _origSchedule = _scheduleReconnectPull;
+    // Override pullAll untuk track waktu terakhir pull
+    const _origPullAll = pullAll;
+    pullAll = async function(){
+      _lastPullTime = Date.now();
+      return _origPullAll();
+    };
+    document.addEventListener('visibilitychange', async ()=>{
       if(document.visibilityState === 'visible' && _status === 'connected'){
-        addLog('👁 App aktif kembali — memeriksa data terbaru...');
-        _scheduleReconnectPull();
+        const elapsed = Date.now() - _lastPullTime;
+        if(elapsed > PULL_THROTTLE_MS){
+          addLog('👁 App aktif kembali — memeriksa data terbaru...');
+          // Cek apakah koneksi Supabase masih aktual (bukan hanya status di memori)
+          // HP yang sleep lama bisa punya WebSocket putus meski _status masih 'connected'
+          try{
+            const {error} = await _client.from('hm_sales').select('id').limit(1);
+            if(error){
+              // Koneksi putus — reconnect dulu baru pull
+              addLog('🔄 Koneksi terputus saat sleep — menghubungkan ulang...', false);
+              await init(_cfg.url, _cfg.key);
+            }
+          }catch(e){
+            await init(_cfg.url, _cfg.key);
+          }
+          _scheduleReconnectPull();
+        }
       }
     });
   }
@@ -3378,12 +3424,20 @@ function render(){
             <div style="font-size:10px;color:var(--tm)">Latest data: ${pl(dp.y,dp.m)}</div>
           </div>
           <button class="theme-btn" id="themeToggle" title="Toggle light/dark">${S.theme==='dark'?'☀️':'🌙'}</button>
-          <div title="Supabase Cloud Status" onclick="S.page='settings';S.settings.tab='supabase';re();" style="cursor:pointer;display:flex;align-items:center;gap:4px;font-size:10px;font-weight:700;color:${SB.isConnected()?'var(--green)':'var(--tm)'}">
-            <span style="font-size:14px">${SB.isConnected()?'☁':'⛅'}</span>
-            <span style="display:none" class="sbStatusLbl">${SB.isConnected()?'Cloud On':'Cloud Off'}</span>
+          <div title="Supabase Cloud Status" onclick="S.page='settings';S.settings.tab='supabase';re();" style="cursor:pointer;display:flex;flex-direction:column;align-items:center;gap:1px;min-width:44px">
+            ${SB.getStatus()==='connecting'
+              ? `<span style="font-size:16px">🔄</span><span style="font-size:9px;color:var(--amber);font-weight:700">Sync...</span>`
+              : SB.isConnected()
+              ? `<span style="font-size:16px">☁️</span><span style="font-size:9px;color:var(--green);font-weight:700">Online</span>`
+              : `<span style="font-size:16px">⛅</span><span style="font-size:9px;color:var(--tm);font-weight:600">Offline</span>`
+            }
           </div>
         </div>
       </div>
+      ${SB.getStatus()==='connecting'
+        ? `<div style="background:rgba(245,158,11,.12);border-bottom:1px solid var(--amber);color:var(--amber);font-size:11px;font-weight:600;padding:7px 16px;text-align:center;letter-spacing:.2px">⏳ Menghubungkan & mengunduh data dari Supabase...</div>`
+        : ''
+      }
       <div class="page">${pageHtml}</div>
       <div style="text-align:center;padding:14px 24px 18px;border-top:1px solid var(--bd);background:var(--bg2);margin-top:8px">
         <div style="font-size:9px;color:var(--tm);opacity:.45;letter-spacing:.3px">Design by Armstrong Sabandar</div>
@@ -4131,18 +4185,32 @@ function bind(){
       const year=parseInt(document.getElementById('sbFullSyncYear')?.value||new Date().getFullYear());
       S.settings.sb.pushMsg=`⏳ Full sync ${year}...`;re();
       let total=0,errs=[];
-      for(const type of ['sales','budget','damage']){
-        for(let m=1;m<=12;m++){
-          let rows;
-          if(type==='sales') rows=Store.getSales(year,m);
-          else if(type==='budget') rows=Store.getBudget(year,m);
-          else rows=Store.getDamage(year,m);
-          if(!rows||!rows.length) continue;
-          const r=await SB.pushPeriod(type,year,m,rows);
-          if(r.ok) total+=r.count; else errs.push(`${type} ${m}/${year}`);
+      // Masalah 4 fix: matikan Realtime selama Full Sync.
+      // Full Sync mendorong hingga 36 pushPeriod (12 bulan × 3 tipe).
+      // Tanpa ini, setiap push memicu Realtime events → scheduleFetch berkali-kali
+      // yang bisa menyebabkan concurrent fetch dan membuang bandwidth.
+      // Setelah selesai, Realtime diaktifkan kembali dan satu pullAll dijalankan.
+      try{ SB.getClient()?.removeAllChannels?.(); }catch(e){}
+      try{
+        for(const type of ['sales','budget','damage']){
+          for(let m=1;m<=12;m++){
+            let rows;
+            if(type==='sales') rows=Store.getSales(year,m);
+            else if(type==='budget') rows=Store.getBudget(year,m);
+            else rows=Store.getDamage(year,m);
+            if(!rows||!rows.length) continue;
+            S.settings.sb.pushMsg=`⏳ Full sync ${year}: push ${type} ${m}/12...`;re();
+            const r=await SB.pushPeriod(type,year,m,rows);
+            if(r.ok) total+=r.count; else errs.push(`${type} ${m}/${year}`);
+          }
         }
+      }finally{
+        // Aktifkan kembali Realtime setelah Full Sync selesai (apapun hasilnya)
+        try{ await SB.init(SB.getCfg().url, SB.getCfg().key); }catch(e){}
       }
-      S.settings.sb.pushMsg=errs.length?`⚠ Selesai dengan error (${errs.join(', ')}). ${total} rows berhasil.`:`✅ Full sync selesai — ${total} rows dikirim ke Supabase`;
+      S.settings.sb.pushMsg=errs.length
+        ?`⚠ Selesai dengan error (${errs.join(', ')}). ${total} rows berhasil.`
+        :`✅ Full sync selesai — ${total} rows dikirim ke Supabase`;
       re();
     };
   }
