@@ -4191,13 +4191,13 @@ function bind(){
       else Store.setDamage(y,m,prev.rows);
 
       // Push ke Supabase dengan progress callback
-      addLog(`⬆ Upload ${tab} ${prev.rows.length} rows → Supabase ${y}/${m}...`);
+      console.log(`⬆ Upload ${tab} ${prev.rows.length} rows → Supabase ${y}/${m}...`);
       const sbr = await SB.pushPeriod(tab,y,m,prev.rows,onProgress);
 
       let sbPushNote='';
       if(sbr.ok){
         sbPushNote=`☁ Tersinkron ke Supabase (${sbr.count} rows) — semua device akan update otomatis`;
-        addLog(`✅ Upload berhasil: ${sbr.count} rows tersimpan di Supabase`);
+        console.log(`✅ Upload berhasil: ${sbr.count} rows tersimpan di Supabase`);
         Store.addSess({id:Date.now().toString(),type:tab,year:y,month:m,filename:prev.filename,rowCount:prev.originalCount,skuCount:prev.rows.length,status:'success',warnings:prev.warns?.length||0,timestamp:new Date().toISOString(),user:S.user?.name||S.user?.email});
       } else {
         // Push gagal — rollback cache agar tidak tampil data yang tidak tersimpan
@@ -4205,7 +4205,7 @@ function bind(){
         else if(tab==='budget')Store.setBudget(y,m,[]);
         else Store.setDamage(y,m,[]);
         sbPushNote=`❌ Gagal simpan ke Supabase: ${sbr.err}`;
-        addLog(`❌ Upload gagal: ${sbr.err}`);
+        console.error(`❌ Upload gagal: ${sbr.err}`);
         Store.addSess({id:Date.now().toString(),type:tab,year:y,month:m,filename:prev.filename,rowCount:prev.originalCount,skuCount:prev.rows.length,status:'failed',warnings:0,timestamp:new Date().toISOString(),user:S.user?.name||S.user?.email});
       }
 
