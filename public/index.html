@@ -1049,11 +1049,17 @@ const SB = (function(){
       _reconnectTimer = null;
       if(_status !== 'connected' || !_client) return;
       addLog('🔄 Reconnect: sinkronisasi ulang data dari Supabase...');
+      // Tampilkan loading agar tidak render dengan cache kosong
+      _appLoading = true;
+      _appLoadMsg = '🔄 Menyinkronkan ulang data...';
+      try{ re(); }catch(e){}
       // Re-subscribe Realtime agar channel aktif kembali
       subscribeRealtime();
       await pullAll();
+      _appLoading = false;
+      _appLoadMsg = '';
       try{ re(); }catch(e){}
-    }, 3000);
+    }, 8000); // 8 detik — cukup lama untuk koneksi mobile yang fluktuatif
   }
 
   // ---- Listener: device kembali online ----
