@@ -805,10 +805,12 @@ const SB = (function(){
     if(_pendingFetches.has(key)) return; // sudah antri, abaikan event duplikat
     _pendingFetches.set(key, setTimeout(async ()=>{
       _pendingFetches.delete(key);
+      // Jangan fetch saat upload berlangsung — data belum selesai ditulis,
+      // dan fetch akan overwrite in-memory cache yang baru saja di-set
+      if(_uploadInProgress) return;
       await fetchPeriod(type, year, month);
-      // Jangan re-render saat upload sedang berlangsung — DOM progress bar akan hancur
       if(!_uploadInProgress){ try{ re(); }catch(e){} }
-    }, 1500));
+    }, 3000));
   }
 
   // ---- Realtime: pull satu periode dari Supabase ke lokal ----
@@ -931,16 +933,13 @@ const SB = (function(){
     if(!_client||_status!=='connected') return {ok:false,err:'Tidak terhubung ke Supabase'};
     const table = `hm_${type}`;
     try{
-      // DELETE dulu semua data periode ini
-      // Pakai .select() agar Supabase JS v2 benar-benar mengeksekusi DELETE dan
-      // mengembalikan error yang akurat (tanpa .select() bisa silent fail di RLS)
+      // DELETE — tanpa .select() agar tidak hang di Supabase JS v2
       addLog(`🗑 Menghapus data lama ${type} ${MONTHS[month-1]} ${year}...`);
       const {error:delErr} = await _client
         .from(table)
         .delete()
         .eq('year', year)
-        .eq('month', month)
-        .select('id');
+        .eq('month', month);
       if(delErr) throw new Error('Delete gagal: '+delErr.message);
 
       if(!rows||!rows.length){
@@ -948,11 +947,8 @@ const SB = (function(){
         return {ok:true, count:0};
       }
 
-      // Chunk size 250 — lebih kecil dari 500 untuk hindari payload timeout
-      // 5000 rows = 20 chunks, masih reasonable
-      const CHUNK = 250;
+      const CHUNK = 200; // lebih kecil = lebih aman dari payload timeout
       let total = 0;
-
       const chunks = [];
       for(let i=0;i<rows.length;i+=CHUNK){
         chunks.push(rows.slice(i,i+CHUNK).map(r=>({
@@ -976,22 +972,33 @@ const SB = (function(){
           if(insErr) throw new Error(`Insert batch ${insertedChunks+1}/${chunks.length} gagal: ${insErr.message}`);
           total += chunk.length;
           insertedChunks++;
-          // Panggil callback progress dari caller (onclick handler punya akses DOM langsung)
+          // Update S.upload.progress agar template render bisa pakai pg.active
+          try{
+            if(typeof S!=='undefined'&&S.upload){
+              const pct = Math.round((total/rows.length)*100);
+              S.upload.progress = {active:true, done:total, total:rows.length, pct};
+            }
+          }catch(e){}
+          // Callback ke onclick handler untuk update DOM langsung
           try{ if(typeof onProgress==='function') onProgress(total, rows.length); }catch(e){}
-          // Log setiap 5 chunk
           if(insertedChunks % 5 === 0 || insertedChunks === chunks.length){
             addLog(`⬆ Progress: ${total}/${rows.length} rows (batch ${insertedChunks}/${chunks.length})`);
           }
         }
       }catch(insError){
         addLog(`⚠ Insert gagal di batch ${insertedChunks+1} — rollback...`, false);
-        await _client.from(table).delete().eq('year',year).eq('month',month).select('id');
+        // Rollback: hapus data partial yang sudah masuk
+        await _client.from(table).delete().eq('year',year).eq('month',month);
         throw insError;
       }
+
+      // Reset progress state
+      try{ if(typeof S!=='undefined'&&S.upload) S.upload.progress={active:false,done:0,total:0,pct:0}; }catch(e){}
 
       addLog(`✅ Push ${type} ${MONTHS[month-1]} ${year} — ${total} rows berhasil`);
       return {ok:true, count:total};
     }catch(e){
+      try{ if(typeof S!=='undefined'&&S.upload) S.upload.progress={active:false,done:0,total:0,pct:0}; }catch(ex){}
       addLog(`❌ Push ${type} ${MONTHS[month-1]} ${year}: ${e.message}`, false);
       return {ok:false, err:e.message};
     }
@@ -1001,8 +1008,8 @@ const SB = (function(){
   async function pullAll(){
     if(!_client||_status!=='connected') return;
     addLog('⏳ Memuat semua data dari Supabase...');
-    // Aktifkan pulling state agar banner loading muncul di mobile
-    try{ if(typeof S!=='undefined'&&S.settings?.sb){ S.settings.sb.pulling=true; re(); } }catch(e){}
+    // Aktifkan pulling state agar banner loading muncul di mobile (kecuali saat upload)
+    try{ if(!_uploadInProgress&&typeof S!=='undefined'&&S.settings?.sb){ S.settings.sb.pulling=true; re(); } }catch(e){}
     const types=['sales','budget','damage'];
     let total=0;
     try{
@@ -1078,15 +1085,11 @@ const SB = (function(){
       addLog('🔄 Reconnect: sinkronisasi ulang data dari Supabase...');
       // Jangan ganggu UI saat upload sedang berjalan
       if(_uploadInProgress) return;
-      // Tampilkan loading agar tidak render dengan cache kosong
-      _appLoading = true;
-      _appLoadMsg = '🔄 Menyinkronkan ulang data...';
-      try{ re(); }catch(e){}
+      // JANGAN set _appLoading=true saat reconnect — data sudah ada di cache,
+      // layar loading akan membuat flicker/blank yang tidak perlu.
       // Re-subscribe Realtime agar channel aktif kembali
       subscribeRealtime();
       await pullAll();
-      _appLoading = false;
-      _appLoadMsg = '';
       if(!_uploadInProgress){ try{ re(); }catch(e){} }
     }, 8000); // 8 detik — cukup lama untuk koneksi mobile yang fluktuatif
   }
@@ -1333,6 +1336,7 @@ function applyTheme(){
   const mc=document.querySelector('meta[name="theme-color"]');
   if(mc)mc.content=S.theme==='light'?'#ffffff':'#0f172a';
 }
+let _lastRenderHtml = ''; // cache HTML render terakhir untuk diff check
 function re(){
   applyTheme();
   const root=document.getElementById('app');
@@ -1340,22 +1344,27 @@ function re(){
 
   // Tampilkan loading screen saat Supabase belum selesai pull data awal
   if(_appLoading){
-    root.innerHTML=`
-      <div style="min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:20px;background:var(--bgc)">
-        <div style="font-size:36px">📊</div>
-        <div style="font-weight:800;font-size:18px;color:var(--t1)">HM284 Analytics</div>
-        <div class="spin" style="width:36px;height:36px"></div>
-        <div style="font-size:13px;color:var(--t2);text-align:center;max-width:280px;line-height:1.6">${esc(_appLoadMsg)}</div>
-        <div style="font-size:11px;color:var(--tm)">Hypermart 284 Ambon City Center</div>
-      </div>`;
+    const loadHtml=`<div style="min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:20px;background:var(--bgc)"><div style="font-size:36px">📊</div><div style="font-weight:800;font-size:18px;color:var(--t1)">HM284 Analytics</div><div class="spin" style="width:36px;height:36px"></div><div style="font-size:13px;color:var(--t2);text-align:center;max-width:280px;line-height:1.6">${esc(_appLoadMsg)}</div><div style="font-size:11px;color:var(--tm)">Hypermart 284 Ambon City Center</div></div>`;
+    if(root.innerHTML!==loadHtml) root.innerHTML=loadHtml;
     return;
   }
 
   // Simpan state navigasi saat ini sebelum render ulang
   saveNavState();
+
+  // ---- ANTI-FLICKER: hanya replace DOM jika konten benar-benar berubah ----
+  // Masalah: Realtime events (INSERT/DELETE per-row) memicu re() berkali-kali
+  // dalam 1-2 detik. Setiap re() = root.innerHTML replace = seluruh layar
+  // dirender ulang = flicker/kedip, terutama terasa di mobile.
+  // Solusi: render HTML ke string dulu, bandingkan dengan render sebelumnya.
+  // Jika sama persis, skip replace + bind = zero flicker.
+  const newHtml = render();
+  if(newHtml === _lastRenderHtml) return; // konten sama, tidak perlu update DOM
+  _lastRenderHtml = newHtml;
+
   // Destroy all Chart.js instances before innerHTML replacement
   Object.keys(_chartInstances).forEach(k=>_destroyChart(k));
-  root.innerHTML=render();
+  root.innerHTML = newHtml;
   bind();
 }
 
@@ -4078,93 +4087,117 @@ function bind(){
     try{
       const{tab,year:y,month:m,prev}=S.upload;
 
-      // --- GUARD: Supabase WAJIB terhubung sebelum commit ---
+      // Guard: Supabase harus terhubung
       if(!SB.isConnected()){
         alert('❌ Tidak terhubung ke Supabase.\n\nData tidak bisa disimpan karena Supabase adalah satu-satunya storage.\n\nTunggu koneksi terhubung lalu coba lagi.');
         return;
       }
 
-      // --- KUNCI: Block Realtime re() agar DOM progress tidak dihancurkan saat upload ---
+      // ----------------------------------------------------------------
+      // STRATEGI: ZERO re() selama upload berlangsung
+      // - _uploadInProgress memblokir semua re() dari Realtime/pullAll
+      // - Progress UI dimanipulasi 100% via DOM langsung (tidak ada re())
+      // - re() hanya dipanggil 1x di akhir untuk pindah ke step 5
+      // ----------------------------------------------------------------
       _uploadInProgress = true;
 
-      // --- Setup progress UI langsung di DOM (satu-satunya tempat inject) ---
-      const totalRows = prev.rows.length;
-      const totalChunks = Math.ceil(totalRows / 250);
+      const totalRows   = prev.rows.length;
+      const totalChunks = Math.ceil(totalRows / 200);
 
-      // Inject progress bar ke DOM (hanya jika belum ada)
-      const confirmBox = document.querySelector('.alert-i');
-      let pgDiv = document.getElementById('upProgress');
-      if(!pgDiv && confirmBox){
+      // Manipulasi DOM langsung — tanpa re() — untuk tampilkan progress UI
+      // Simpan referensi ke elemen yang sudah ada di DOM sekarang
+      const confirmBtn  = upcf;                                    // tombol Confirm yg diklik
+      const backBtn     = document.getElementById('upBack');
+      const alertBox    = document.querySelector('.alert-i');
+      const wizardBox   = confirmBtn.closest('div');               // container tombol
+
+      // Disable tombol
+      if(backBtn)   { backBtn.disabled=true; backBtn.style.opacity='.4'; }
+      confirmBtn.disabled=true;
+      confirmBtn.textContent='⏳ 0% — memulai...';
+
+      // Inject progress bar tepat setelah alert-i (ganti area tombol)
+      // Gunakan elemen yang sudah pasti ada: alertBox atau wizardBox
+      const insertTarget = alertBox || wizardBox;
+      let pgDiv = document.getElementById('_upPgDiv');
+      if(!pgDiv){
         pgDiv = document.createElement('div');
-        pgDiv.id = 'upProgress';
-        pgDiv.style.cssText = 'margin:16px 0';
+        pgDiv.id = '_upPgDiv';
+        pgDiv.style.cssText = 'margin-top:16px';
         pgDiv.innerHTML = `
-          <div style="display:flex;justify-content:space-between;margin-bottom:6px">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
             <span style="font-size:12px;color:var(--t2)">Menyimpan ke Supabase...</span>
-            <span id="upPct" style="font-size:13px;font-weight:700;color:var(--pri)">0%</span>
+            <span id="_upPct" style="font-size:13px;font-weight:700;color:var(--pri)">0%</span>
           </div>
           <div style="background:var(--brd);border-radius:99px;height:10px;overflow:hidden">
-            <div id="upBar" style="height:100%;width:0%;background:linear-gradient(90deg,var(--pri),#60a5fa);border-radius:99px;transition:width .3s ease"></div>
+            <div id="_upBar" style="height:100%;width:0%;background:linear-gradient(90deg,var(--pri),#60a5fa);border-radius:99px;transition:width .35s ease"></div>
           </div>
-          <div id="upInfo" style="font-size:11px;color:var(--tm);margin-top:5px;text-align:center">
+          <div id="_upInfo" style="font-size:11px;color:var(--tm);margin-top:5px;text-align:center">
             0 / ${totalRows.toLocaleString('id')} rows
           </div>`;
-        confirmBox.insertAdjacentElement('afterend', pgDiv);
+        if(insertTarget) insertTarget.insertAdjacentElement('afterend', pgDiv);
+        else document.getElementById('app').appendChild(pgDiv);
       }
 
-      // Disable tombol, ubah teks
-      const backBtn = document.getElementById('upBack');
-      if(backBtn){ backBtn.disabled=true; backBtn.style.opacity='.4'; }
-      if(upcf){ upcf.disabled=true; upcf.textContent='⏳ 0% — memulai...'; }
+      // Simpan referensi elemen progress (setelah inject, pasti ada)
+      const pctEl  = document.getElementById('_upPct');
+      const barEl  = document.getElementById('_upBar');
+      const infoEl = document.getElementById('_upInfo');
 
-      // Callback progress — update DOM langsung setiap batch selesai
+      // Callback dipanggil setiap batch selesai dari pushPeriod
       function onProgress(done, total){
-        const pct = Math.round((done/total)*100);
-        const doneChunk = Math.ceil(done/250);
-        const pctEl  = document.getElementById('upPct');
-        const barEl  = document.getElementById('upBar');
-        const infoEl = document.getElementById('upInfo');
-        if(pctEl)  pctEl.textContent = pct+'%';
-        if(barEl)  barEl.style.width = pct+'%';
-        if(infoEl) infoEl.textContent = done.toLocaleString('id')+' / '+total.toLocaleString('id')+' rows · batch '+doneChunk+'/'+totalChunks;
-        if(upcf)   upcf.textContent = '⏳ '+pct+'% — '+done.toLocaleString('id')+' dari '+total.toLocaleString('id')+' rows';
+        const pct       = Math.round((done/total)*100);
+        const doneChunk = Math.ceil(done/200);
+        if(pctEl)  pctEl.textContent  = pct+'%';
+        if(barEl)  barEl.style.width  = pct+'%';
+        if(infoEl) infoEl.textContent = `${done.toLocaleString('id')} / ${total.toLocaleString('id')} rows · batch ${doneChunk}/${totalChunks}`;
+        confirmBtn.textContent = `⏳ ${pct}% — ${done.toLocaleString('id')} dari ${total.toLocaleString('id')} rows`;
       }
 
-      // Simpan ke cache dulu (in-memory, untuk render langsung)
+      // Simpan ke in-memory cache dulu (render dashboard tidak perlu tunggu Supabase)
       if(tab==='sales')Store.setSales(y,m,prev.rows);
       else if(tab==='budget')Store.setBudget(y,m,prev.rows);
       else Store.setDamage(y,m,prev.rows);
 
-      // Push ke Supabase dengan progress callback
+      // Push ke Supabase — ini async, bisa makan 10-30 detik untuk 5000+ rows
       addLog(`⬆ Upload ${tab} ${prev.rows.length} rows → Supabase ${y}/${m}...`);
       const sbr = await SB.pushPeriod(tab,y,m,prev.rows,onProgress);
 
       let sbPushNote='';
       if(sbr.ok){
-        sbPushNote=`☁ Tersinkron ke Supabase (${sbr.count} rows) — semua device akan update otomatis`;
+        sbPushNote = `☁ Tersinkron ke Supabase (${sbr.count} rows) — semua device akan update otomatis`;
         addLog(`✅ Upload berhasil: ${sbr.count} rows tersimpan di Supabase`);
         Store.addSess({id:Date.now().toString(),type:tab,year:y,month:m,filename:prev.filename,rowCount:prev.originalCount,skuCount:prev.rows.length,status:'success',warnings:prev.warns?.length||0,timestamp:new Date().toISOString(),user:S.user?.name||S.user?.email});
-      } else {
-        // Push gagal — rollback cache agar tidak tampil data yang tidak tersimpan
+      }else{
+        // Rollback cache — jangan tampilkan data yang gagal simpan
         if(tab==='sales')Store.setSales(y,m,[]);
         else if(tab==='budget')Store.setBudget(y,m,[]);
         else Store.setDamage(y,m,[]);
-        sbPushNote=`❌ Gagal simpan ke Supabase: ${sbr.err}`;
+        sbPushNote = `❌ Gagal simpan ke Supabase: ${sbr.err}`;
         addLog(`❌ Upload gagal: ${sbr.err}`);
         Store.addSess({id:Date.now().toString(),type:tab,year:y,month:m,filename:prev.filename,rowCount:prev.originalCount,skuCount:prev.rows.length,status:'failed',warnings:0,timestamp:new Date().toISOString(),user:S.user?.name||S.user?.email});
       }
 
-      // --- LEPAS KUNCI: upload selesai, Realtime boleh re() lagi ---
+      // Lepas kunci — Realtime boleh re() lagi
       _uploadInProgress = false;
 
-      S.upload.res={success:sbr.ok,rows:prev.rows.length,sbNote:sbPushNote};
-      S.upload.step=5;re();
+      // Bersihkan progress DOM agar tidak terbawa ke step 5
+      try{ if(pgDiv && pgDiv.parentNode) pgDiv.parentNode.removeChild(pgDiv); }catch(e){}
+
+      // Pindah ke step 5 — satu-satunya re() dalam seluruh flow upload
+      S.upload.progress = {active:false,done:0,total:0,pct:0};
+      S.upload.res      = {success:sbr.ok, rows:prev.rows.length, sbNote:sbPushNote};
+      S.upload.step     = 5;
+      re();
+
     }catch(err){
-      // Pastikan flag selalu dilepas meski ada exception
       _uploadInProgress = false;
+      try{ const pg=document.getElementById('_upPgDiv'); if(pg&&pg.parentNode)pg.parentNode.removeChild(pg); }catch(e){}
       addLog(`❌ Upload exception: ${err.message}`);
-      S.upload.res={success:false,msg:err.message};
-      S.upload.step=5;re();
+      S.upload.progress = {active:false,done:0,total:0,pct:0};
+      S.upload.res      = {success:false, msg:err.message};
+      S.upload.step     = 5;
+      re();
     }
   };
   const upr=document.getElementById('upReset');if(upr)upr.onclick=()=>{S.upload.step=1;S.upload.prev=null;S.upload.res=null;S.upload.progress={active:false,done:0,total:0,pct:0};re();};
