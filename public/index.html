@@ -1128,6 +1128,7 @@ const SB = (function(){
       _appLoadMsg='';
       // Re-apply default period setelah data loaded agar dashboard langsung ke periode terbaru
       try{
+        // Setelah data loaded, set semua period ke periode terbaru yang ada datanya
         const dp2=defPeriod();
         S.dash.year=dp2.y;S.dash.month=dp2.m;S.dash.monthEnd=dp2.m;
         S.sales.year=dp2.y;S.sales.month=dp2.m;
@@ -1139,8 +1140,13 @@ const SB = (function(){
         S.cat.year=dp2.y;S.cat.month=dp2.m;
         S.budg.year=dp2.y;S.budg.month=dp2.m;
         S.rep.year=dp2.y;S.rep.month=dp2.m;
-        // Restore nav state dari localStorage (halaman terakhir yang dibuka)
-        restoreNavState();
+        // Restore HANYA halaman aktif dari localStorage — JANGAN restore year/month
+        // karena year/month sudah di-set oleh defPeriod() di atas berdasarkan data nyata.
+        // Restore year/month dari state lama (saat data belum ada) akan overwrite ke periode kosong.
+        try{
+          const saved = DB.g(NAV_STATE_KEY);
+          if(saved && saved._v === NAV_STATE_VERSION && saved.page) S.page = saved.page;
+        }catch(e){}
       }catch(e){}
       try{
         if(typeof S!=='undefined'&&S.settings&&S.settings.sb){
@@ -1285,9 +1291,8 @@ function restoreNavState(){
   }catch(e){}
 }
 
-// restoreNavState dipanggil setelah pullAll() selesai (di dalam autoInit)
-// Tidak perlu onStorageReady karena localStorage langsung tersedia
-restoreNavState();
+// restoreNavState (hanya page) dipanggil di dalam autoInit setelah pullAll selesai
+// TIDAK dipanggil di sini — saat startup data belum ada di cache
 
 // ---- RENDER ENGINE ----
 function h(tag,attrs={},inner=''){
