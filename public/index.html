@@ -967,16 +967,59 @@ const SB = (function(){
       addLog(`⬆ Insert ${rows.length} rows dalam ${chunks.length} batch...`);
       let insertedChunks = 0;
 
-      // Helper: update progress dan render di main thread
+      // Helper: update progress DOM langsung tanpa re() penuh
+      // re() penuh akan trigger bind() baru yang interrupt proses upload
       function setProgress(done, total, active){
         try{
-          if(typeof S==='undefined'||!S.upload) return;
-          const pct = total>0 ? Math.round((done/total)*100) : 0;
-          S.upload.progress = {active, done, total, pct};
-          // setTimeout 0 — pastikan state sudah ter-set sebelum re() dipanggil
-          setTimeout(()=>{ try{ re(); }catch(e){} }, 0);
+          if(typeof S!=='undefined'&&S.upload){
+            const pct = total>0 ? Math.round((done/total)*100) : 0;
+            S.upload.progress = {active, done, total, pct};
+          }
+        }catch(e){}
+        // Update DOM elemen progress secara langsung
+        try{
+          const pctEl  = document.getElementById('upPct');
+          const barEl  = document.getElementById('upBar');
+          const infoEl = document.getElementById('upInfo');
+          const btnEl  = document.getElementById('upConfirm');
+          const pct    = total>0 ? Math.round((done/total)*100) : 0;
+          if(pctEl)  pctEl.textContent  = pct+'%';
+          if(barEl)  barEl.style.width  = pct+'%';
+          if(infoEl) infoEl.textContent = done.toLocaleString('id')+' / '+total.toLocaleString('id')+' rows';
+          if(btnEl)  btnEl.textContent  = '⏳ '+pct+'% — '+done.toLocaleString('id')+' dari '+total.toLocaleString('id')+' rows';
+          // Tampilkan container progress jika belum ada
+          const pgEl = document.getElementById('upProgress');
+          if(pgEl) pgEl.style.display = active ? 'block' : 'none';
         }catch(e){}
       }
+
+      // Inject progress container ke DOM sebelum mulai insert
+      try{
+        const totalChunks = chunks.length;
+        const confirmArea = document.querySelector('.alert-i');
+        if(confirmArea && !document.getElementById('upProgress')){
+          const pgDiv = document.createElement('div');
+          pgDiv.id = 'upProgress';
+          pgDiv.style.cssText = 'margin-top:16px';
+          pgDiv.innerHTML = `
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+              <span style="font-size:12px;color:var(--t2)">Menyimpan ke Supabase...</span>
+              <span id="upPct" style="font-size:13px;font-weight:700;color:var(--pri)">0%</span>
+            </div>
+            <div style="background:var(--brd);border-radius:99px;height:10px;overflow:hidden">
+              <div id="upBar" style="height:100%;width:0%;background:linear-gradient(90deg,var(--pri),#60a5fa);border-radius:99px;transition:width .4s ease"></div>
+            </div>
+            <div id="upInfo" style="font-size:11px;color:var(--tm);margin-top:6px;text-align:center">
+              0 / ${rows.length.toLocaleString('id')} rows
+            </div>`;
+          confirmArea.insertAdjacentElement('afterend', pgDiv);
+        }
+        // Disable tombol Back & Confirm saat proses berlangsung
+        const backBtn = document.getElementById('upBack');
+        const cfBtn   = document.getElementById('upConfirm');
+        if(backBtn){ backBtn.disabled=true; backBtn.style.opacity='.4'; }
+        if(cfBtn)  { cfBtn.disabled=true; cfBtn.textContent='⏳ 0% — memulai...'; }
+      }catch(e){}
 
       // Init progress
       setProgress(0, rows.length, true);
