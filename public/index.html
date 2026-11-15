@@ -925,15 +925,28 @@ const SB = (function(){
     if(!_client||_status!=='connected') return {ok:false,err:'Tidak terhubung ke Supabase'};
     const table = `hm_${type}`;
     try{
-      const {error:delErr} = await _client.from(table).delete().eq('year',year).eq('month',month);
+      // DELETE dulu semua data periode ini
+      // Pakai .select() agar Supabase JS v2 benar-benar mengeksekusi DELETE dan
+      // mengembalikan error yang akurat (tanpa .select() bisa silent fail di RLS)
+      addLog(`🗑 Menghapus data lama ${type} ${MONTHS[month-1]} ${year}...`);
+      const {error:delErr} = await _client
+        .from(table)
+        .delete()
+        .eq('year', year)
+        .eq('month', month)
+        .select('id');
       if(delErr) throw new Error('Delete gagal: '+delErr.message);
-      if(!rows||!rows.length){ addLog(`✅ Push ${type} ${month}/${year} — 0 rows`); return {ok:true,count:0}; }
-      const CHUNK=500; let total=0;
-      // Masalah 2 fix: simpan data lokal sebagai backup sebelum mulai insert.
-      // Jika insert chunk manapun gagal di tengah jalan, Supabase sudah di-delete
-      // tapi belum terisi penuh → kondisi partial/rusak.
-      // Solusi: jika ada insert yang gagal, langsung coba delete ulang sisa
-      // yang sudah masuk dan lempar error agar caller tahu push tidak berhasil.
+
+      if(!rows||!rows.length){
+        addLog(`✅ Push ${type} ${MONTHS[month-1]} ${year} — 0 rows`);
+        return {ok:true, count:0};
+      }
+
+      // Chunk size 250 — lebih kecil dari 500 untuk hindari payload timeout
+      // 5000 rows = 20 chunks, masih reasonable
+      const CHUNK = 250;
+      let total = 0;
+
       const chunks = [];
       for(let i=0;i<rows.length;i+=CHUNK){
         chunks.push(rows.slice(i,i+CHUNK).map(r=>({
@@ -947,25 +960,31 @@ const SB = (function(){
           ...(type==='damage'&&{total_cost:Number(r.total_cost||0),qty:Number(r.qty||0)}),
         })));
       }
-      let insertedChunks=0;
+
+      addLog(`⬆ Insert ${rows.length} rows dalam ${chunks.length} batch...`);
+      let insertedChunks = 0;
       try{
         for(const chunk of chunks){
           const {error:insErr} = await _client.from(table).insert(chunk);
-          if(insErr) throw new Error('Insert gagal chunk '+(insertedChunks+1)+': '+insErr.message);
-          total+=chunk.length;
+          if(insErr) throw new Error(`Insert batch ${insertedChunks+1}/${chunks.length} gagal: ${insErr.message}`);
+          total += chunk.length;
           insertedChunks++;
+          // Log progress setiap 5 chunk
+          if(insertedChunks % 5 === 0 || insertedChunks === chunks.length){
+            addLog(`⬆ Progress: ${total}/${rows.length} rows (batch ${insertedChunks}/${chunks.length})`);
+          }
         }
       }catch(insError){
-        // Partial insert terjadi — hapus semua data yang sudah masuk
-        // agar Supabase tidak menyimpan data yang tidak lengkap
-        addLog(`⚠ Push partial — rollback ${type} ${MONTHS[month-1]} ${year}...`, false);
-        await _client.from(table).delete().eq('year',year).eq('month',month);
-        throw insError; // lempar ke outer catch
+        // Partial insert — rollback semua
+        addLog(`⚠ Insert gagal di batch ${insertedChunks+1} — rollback...`, false);
+        await _client.from(table).delete().eq('year',year).eq('month',month).select('id');
+        throw insError;
       }
-      addLog(`✅ Push ${type} ${MONTHS[month-1]} ${year} — ${total} rows`);
+
+      addLog(`✅ Push ${type} ${MONTHS[month-1]} ${year} — ${total} rows berhasil`);
       return {ok:true, count:total};
     }catch(e){
-      addLog(`❌ Push ${type} ${month}/${year}: ${e.message}`, false);
+      addLog(`❌ Push ${type} ${MONTHS[month-1]} ${year}: ${e.message}`, false);
       return {ok:false, err:e.message};
     }
   }
@@ -4030,6 +4049,9 @@ function bind(){
         alert('❌ Tidak terhubung ke Supabase.\n\nData tidak bisa disimpan karena Supabase adalah satu-satunya storage.\n\nTunggu koneksi terhubung lalu coba lagi.');
         return;
       }
+
+      // Tampilkan status uploading di tombol agar user tahu sedang proses
+      if(upcf){ upcf.disabled=true; upcf.textContent='⏳ Menyimpan ke Supabase...'; }
 
       // Simpan ke cache dulu (in-memory, untuk render langsung)
       if(tab==='sales')Store.setSales(y,m,prev.rows);
