@@ -924,7 +924,8 @@ const SB = (function(){
   }
 
   // ---- Push data ke Supabase (trigger Realtime ke semua device) ----
-  async function pushPeriod(type, year, month, rows){
+  // onProgress(done, total) dipanggil setiap batch selesai — opsional
+  async function pushPeriod(type, year, month, rows, onProgress){
     if(!_client||_status!=='connected') return {ok:false,err:'Tidak terhubung ke Supabase'};
     const table = `hm_${type}`;
     try{
@@ -1030,8 +1031,8 @@ const SB = (function(){
           if(insErr) throw new Error(`Insert batch ${insertedChunks+1}/${chunks.length} gagal: ${insErr.message}`);
           total += chunk.length;
           insertedChunks++;
-          // Update progress setiap batch
-          setProgress(total, rows.length, true);
+          // Panggil callback progress dari caller (onclick handler punya akses DOM langsung)
+          try{ if(typeof onProgress==='function') onProgress(total, rows.length); }catch(e){}
           // Log setiap 5 chunk
           if(insertedChunks % 5 === 0 || insertedChunks === chunks.length){
             addLog(`⬆ Progress: ${total}/${rows.length} rows (batch ${insertedChunks}/${chunks.length})`);
@@ -4141,17 +4142,57 @@ function bind(){
         return;
       }
 
-      // Tampilkan status uploading di tombol agar user tahu sedang proses
-      if(upcf){ upcf.disabled=true; upcf.textContent='⏳ Menyimpan ke Supabase...'; }
+      // --- Setup progress UI langsung di DOM ---
+      const totalRows = prev.rows.length;
+      const totalChunks = Math.ceil(totalRows / 250);
+
+      // Inject progress bar ke DOM
+      const confirmBox = document.querySelector('.alert-i');
+      let pgDiv = document.getElementById('upProgress');
+      if(!pgDiv && confirmBox){
+        pgDiv = document.createElement('div');
+        pgDiv.id = 'upProgress';
+        pgDiv.style.cssText = 'margin:16px 0';
+        pgDiv.innerHTML = `
+          <div style="display:flex;justify-content:space-between;margin-bottom:6px">
+            <span style="font-size:12px;color:var(--t2)">Menyimpan ke Supabase...</span>
+            <span id="upPct" style="font-size:13px;font-weight:700;color:var(--pri)">0%</span>
+          </div>
+          <div style="background:var(--brd);border-radius:99px;height:10px;overflow:hidden">
+            <div id="upBar" style="height:100%;width:0%;background:linear-gradient(90deg,var(--pri),#60a5fa);border-radius:99px;transition:width .3s ease"></div>
+          </div>
+          <div id="upInfo" style="font-size:11px;color:var(--tm);margin-top:5px;text-align:center">
+            0 / ${totalRows.toLocaleString('id')} rows
+          </div>`;
+        confirmBox.insertAdjacentElement('afterend', pgDiv);
+      }
+
+      // Disable tombol, ubah teks
+      const backBtn = document.getElementById('upBack');
+      if(backBtn){ backBtn.disabled=true; backBtn.style.opacity='.4'; }
+      if(upcf){ upcf.disabled=true; upcf.textContent='⏳ 0% — memulai...'; }
+
+      // Callback progress — dipanggil setiap batch dari pushPeriod
+      function onProgress(done, total){
+        const pct = Math.round((done/total)*100);
+        const doneChunk = Math.round(done/250);
+        const pctEl = document.getElementById('upPct');
+        const barEl = document.getElementById('upBar');
+        const infoEl = document.getElementById('upInfo');
+        if(pctEl)  pctEl.textContent = pct+'%';
+        if(barEl)  barEl.style.width = pct+'%';
+        if(infoEl) infoEl.textContent = done.toLocaleString('id')+' / '+total.toLocaleString('id')+' rows · batch '+doneChunk+'/'+totalChunks;
+        if(upcf)   upcf.textContent = '⏳ '+pct+'% — '+done.toLocaleString('id')+' dari '+total.toLocaleString('id')+' rows';
+      }
 
       // Simpan ke cache dulu (in-memory, untuk render langsung)
       if(tab==='sales')Store.setSales(y,m,prev.rows);
       else if(tab==='budget')Store.setBudget(y,m,prev.rows);
       else Store.setDamage(y,m,prev.rows);
 
-      // Push ke Supabase — INI yang membuat data tersinkron ke semua device
+      // Push ke Supabase dengan progress callback
       addLog(`⬆ Upload ${tab} ${prev.rows.length} rows → Supabase ${y}/${m}...`);
-      const sbr = await SB.pushPeriod(tab,y,m,prev.rows);
+      const sbr = await SB.pushPeriod(tab,y,m,prev.rows,onProgress);
 
       let sbPushNote='';
       if(sbr.ok){
