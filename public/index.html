@@ -4023,22 +4023,45 @@ function bind(){
   if(upcf)upcf.onclick=async()=>{
     try{
       const{tab,year:y,month:m,prev}=S.upload;
+
+      // --- GUARD: Supabase WAJIB terhubung sebelum commit ---
+      // Di arsitektur Supabase-only, data yang tidak ter-push akan hilang saat browser ditutup
+      if(!SB.isConnected()){
+        alert('❌ Tidak terhubung ke Supabase.\n\nData tidak bisa disimpan karena Supabase adalah satu-satunya storage.\n\nTunggu koneksi terhubung lalu coba lagi.');
+        return;
+      }
+
+      // Simpan ke cache dulu (in-memory, untuk render langsung)
       if(tab==='sales')Store.setSales(y,m,prev.rows);
       else if(tab==='budget')Store.setBudget(y,m,prev.rows);
       else Store.setDamage(y,m,prev.rows);
-      Store.addSess({id:Date.now().toString(),type:tab,year:y,month:m,filename:prev.filename,rowCount:prev.originalCount,skuCount:prev.rows.length,status:'success',warnings:prev.warns?.length||0,timestamp:new Date().toISOString(),user:S.user?.name||S.user?.email});
-      // Auto-push ke Supabase — Realtime otomatis notify semua device
+
+      // Push ke Supabase — INI yang membuat data tersinkron ke semua device
+      addLog(`⬆ Upload ${tab} ${prev.rows.length} rows → Supabase ${y}/${m}...`);
+      const sbr = await SB.pushPeriod(tab,y,m,prev.rows);
+
       let sbPushNote='';
-      if(SB.isConnected()){
-        const sbr = await SB.pushPeriod(tab,y,m,prev.rows);
-        sbPushNote = sbr.ok
-          ? `☁ Tersinkron ke Supabase (${sbr.count} rows) — semua device akan update otomatis`
-          : `⚠ Sync ke Supabase gagal: ${sbr.err}`;
+      if(sbr.ok){
+        sbPushNote=`☁ Tersinkron ke Supabase (${sbr.count} rows) — semua device akan update otomatis`;
+        addLog(`✅ Upload berhasil: ${sbr.count} rows tersimpan di Supabase`);
+        Store.addSess({id:Date.now().toString(),type:tab,year:y,month:m,filename:prev.filename,rowCount:prev.originalCount,skuCount:prev.rows.length,status:'success',warnings:prev.warns?.length||0,timestamp:new Date().toISOString(),user:S.user?.name||S.user?.email});
       } else {
-        sbPushNote='⚠ Tidak terhubung Supabase — data tersimpan lokal saja';
+        // Push gagal — rollback cache agar tidak tampil data yang tidak tersimpan
+        if(tab==='sales')Store.setSales(y,m,[]);
+        else if(tab==='budget')Store.setBudget(y,m,[]);
+        else Store.setDamage(y,m,[]);
+        sbPushNote=`❌ Gagal simpan ke Supabase: ${sbr.err}`;
+        addLog(`❌ Upload gagal: ${sbr.err}`);
+        Store.addSess({id:Date.now().toString(),type:tab,year:y,month:m,filename:prev.filename,rowCount:prev.originalCount,skuCount:prev.rows.length,status:'failed',warnings:0,timestamp:new Date().toISOString(),user:S.user?.name||S.user?.email});
       }
-      S.upload.res={success:true,rows:prev.rows.length,sbNote:sbPushNote};S.upload.step=5;re();
-    }catch(err){S.upload.res={success:false,msg:err.message};S.upload.step=5;re();}
+
+      S.upload.res={success:sbr.ok,rows:prev.rows.length,sbNote:sbPushNote};
+      S.upload.step=5;re();
+    }catch(err){
+      addLog(`❌ Upload exception: ${err.message}`);
+      S.upload.res={success:false,msg:err.message};
+      S.upload.step=5;re();
+    }
   };
   const upr=document.getElementById('upReset');if(upr)upr.onclick=()=>{S.upload.step=1;S.upload.prev=null;S.upload.res=null;re();};
 
