@@ -757,6 +757,7 @@ if(Store.getUsers().length===0)Store.setUsers([{id:'1',email:'admin@hypermart.co
 // ============================================================
 let _appLoading = true; // true saat pertama buka, sampai pullAll selesai
 let _appLoadMsg = '⏳ Menghubungkan ke Supabase...';
+let _uploadInProgress = false; // guard: block re() dari Realtime saat upload berjalan
 
 // ============================================================
 // SUPABASE INTEGRATION ENGINE v2 — Realtime
@@ -805,7 +806,8 @@ const SB = (function(){
     _pendingFetches.set(key, setTimeout(async ()=>{
       _pendingFetches.delete(key);
       await fetchPeriod(type, year, month);
-      try{ re(); }catch(e){}
+      // Jangan re-render saat upload sedang berlangsung — DOM progress bar akan hancur
+      if(!_uploadInProgress){ try{ re(); }catch(e){} }
     }, 1500));
   }
 
@@ -968,63 +970,6 @@ const SB = (function(){
       addLog(`⬆ Insert ${rows.length} rows dalam ${chunks.length} batch...`);
       let insertedChunks = 0;
 
-      // Helper: update progress DOM langsung tanpa re() penuh
-      // re() penuh akan trigger bind() baru yang interrupt proses upload
-      function setProgress(done, total, active){
-        try{
-          if(typeof S!=='undefined'&&S.upload){
-            const pct = total>0 ? Math.round((done/total)*100) : 0;
-            S.upload.progress = {active, done, total, pct};
-          }
-        }catch(e){}
-        // Update DOM elemen progress secara langsung
-        try{
-          const pctEl  = document.getElementById('upPct');
-          const barEl  = document.getElementById('upBar');
-          const infoEl = document.getElementById('upInfo');
-          const btnEl  = document.getElementById('upConfirm');
-          const pct    = total>0 ? Math.round((done/total)*100) : 0;
-          if(pctEl)  pctEl.textContent  = pct+'%';
-          if(barEl)  barEl.style.width  = pct+'%';
-          if(infoEl) infoEl.textContent = done.toLocaleString('id')+' / '+total.toLocaleString('id')+' rows';
-          if(btnEl)  btnEl.textContent  = '⏳ '+pct+'% — '+done.toLocaleString('id')+' dari '+total.toLocaleString('id')+' rows';
-          // Tampilkan container progress jika belum ada
-          const pgEl = document.getElementById('upProgress');
-          if(pgEl) pgEl.style.display = active ? 'block' : 'none';
-        }catch(e){}
-      }
-
-      // Inject progress container ke DOM sebelum mulai insert
-      try{
-        const totalChunks = chunks.length;
-        const confirmArea = document.querySelector('.alert-i');
-        if(confirmArea && !document.getElementById('upProgress')){
-          const pgDiv = document.createElement('div');
-          pgDiv.id = 'upProgress';
-          pgDiv.style.cssText = 'margin-top:16px';
-          pgDiv.innerHTML = `
-            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
-              <span style="font-size:12px;color:var(--t2)">Menyimpan ke Supabase...</span>
-              <span id="upPct" style="font-size:13px;font-weight:700;color:var(--pri)">0%</span>
-            </div>
-            <div style="background:var(--brd);border-radius:99px;height:10px;overflow:hidden">
-              <div id="upBar" style="height:100%;width:0%;background:linear-gradient(90deg,var(--pri),#60a5fa);border-radius:99px;transition:width .4s ease"></div>
-            </div>
-            <div id="upInfo" style="font-size:11px;color:var(--tm);margin-top:6px;text-align:center">
-              0 / ${rows.length.toLocaleString('id')} rows
-            </div>`;
-          confirmArea.insertAdjacentElement('afterend', pgDiv);
-        }
-        // Disable tombol Back & Confirm saat proses berlangsung
-        const backBtn = document.getElementById('upBack');
-        const cfBtn   = document.getElementById('upConfirm');
-        if(backBtn){ backBtn.disabled=true; backBtn.style.opacity='.4'; }
-        if(cfBtn)  { cfBtn.disabled=true; cfBtn.textContent='⏳ 0% — memulai...'; }
-      }catch(e){}
-
-      // Init progress
-      setProgress(0, rows.length, true);
-
       try{
         for(const chunk of chunks){
           const {error:insErr} = await _client.from(table).insert(chunk);
@@ -1040,13 +985,9 @@ const SB = (function(){
         }
       }catch(insError){
         addLog(`⚠ Insert gagal di batch ${insertedChunks+1} — rollback...`, false);
-        setProgress(0, 0, false);
         await _client.from(table).delete().eq('year',year).eq('month',month).select('id');
         throw insError;
       }
-
-      // Reset progress setelah selesai
-      setProgress(0, 0, false);
 
       addLog(`✅ Push ${type} ${MONTHS[month-1]} ${year} — ${total} rows berhasil`);
       return {ok:true, count:total};
@@ -1079,7 +1020,7 @@ const SB = (function(){
     }finally{
       // Pastikan pulling state selalu direset meski ada error
       try{ if(typeof S!=='undefined'&&S.settings?.sb){ S.settings.sb.pulling=false; } }catch(e){}
-      try{ re(); }catch(e){}
+      if(!_uploadInProgress){ try{ re(); }catch(e){} }
     }
   }
 
@@ -1094,7 +1035,7 @@ const SB = (function(){
       addLog(`⏳ Pull ${type} ${MONTHS[month-1]} ${year}...`);
       const count = await fetchPeriod(type, year, month);
       addLog(`✅ Pull ${type} ${MONTHS[month-1]} ${year}: ${count} rows`);
-      try{ re(); }catch(e){}
+      if(!_uploadInProgress){ try{ re(); }catch(e){} }
       return {ok:true, count};
     }catch(e){
       addLog(`❌ Pull ${type} ${month}/${year} gagal: ${e.message}`, false);
@@ -1135,6 +1076,8 @@ const SB = (function(){
       _reconnectTimer = null;
       if(_status !== 'connected' || !_client) return;
       addLog('🔄 Reconnect: sinkronisasi ulang data dari Supabase...');
+      // Jangan ganggu UI saat upload sedang berjalan
+      if(_uploadInProgress) return;
       // Tampilkan loading agar tidak render dengan cache kosong
       _appLoading = true;
       _appLoadMsg = '🔄 Menyinkronkan ulang data...';
@@ -1144,7 +1087,7 @@ const SB = (function(){
       await pullAll();
       _appLoading = false;
       _appLoadMsg = '';
-      try{ re(); }catch(e){}
+      if(!_uploadInProgress){ try{ re(); }catch(e){} }
     }, 8000); // 8 detik — cukup lama untuk koneksi mobile yang fluktuatif
   }
 
@@ -4136,17 +4079,19 @@ function bind(){
       const{tab,year:y,month:m,prev}=S.upload;
 
       // --- GUARD: Supabase WAJIB terhubung sebelum commit ---
-      // Di arsitektur Supabase-only, data yang tidak ter-push akan hilang saat browser ditutup
       if(!SB.isConnected()){
         alert('❌ Tidak terhubung ke Supabase.\n\nData tidak bisa disimpan karena Supabase adalah satu-satunya storage.\n\nTunggu koneksi terhubung lalu coba lagi.');
         return;
       }
 
-      // --- Setup progress UI langsung di DOM ---
+      // --- KUNCI: Block Realtime re() agar DOM progress tidak dihancurkan saat upload ---
+      _uploadInProgress = true;
+
+      // --- Setup progress UI langsung di DOM (satu-satunya tempat inject) ---
       const totalRows = prev.rows.length;
       const totalChunks = Math.ceil(totalRows / 250);
 
-      // Inject progress bar ke DOM
+      // Inject progress bar ke DOM (hanya jika belum ada)
       const confirmBox = document.querySelector('.alert-i');
       let pgDiv = document.getElementById('upProgress');
       if(!pgDiv && confirmBox){
@@ -4172,12 +4117,12 @@ function bind(){
       if(backBtn){ backBtn.disabled=true; backBtn.style.opacity='.4'; }
       if(upcf){ upcf.disabled=true; upcf.textContent='⏳ 0% — memulai...'; }
 
-      // Callback progress — dipanggil setiap batch dari pushPeriod
+      // Callback progress — update DOM langsung setiap batch selesai
       function onProgress(done, total){
         const pct = Math.round((done/total)*100);
-        const doneChunk = Math.round(done/250);
-        const pctEl = document.getElementById('upPct');
-        const barEl = document.getElementById('upBar');
+        const doneChunk = Math.ceil(done/250);
+        const pctEl  = document.getElementById('upPct');
+        const barEl  = document.getElementById('upBar');
         const infoEl = document.getElementById('upInfo');
         if(pctEl)  pctEl.textContent = pct+'%';
         if(barEl)  barEl.style.width = pct+'%';
@@ -4209,9 +4154,14 @@ function bind(){
         Store.addSess({id:Date.now().toString(),type:tab,year:y,month:m,filename:prev.filename,rowCount:prev.originalCount,skuCount:prev.rows.length,status:'failed',warnings:0,timestamp:new Date().toISOString(),user:S.user?.name||S.user?.email});
       }
 
+      // --- LEPAS KUNCI: upload selesai, Realtime boleh re() lagi ---
+      _uploadInProgress = false;
+
       S.upload.res={success:sbr.ok,rows:prev.rows.length,sbNote:sbPushNote};
       S.upload.step=5;re();
     }catch(err){
+      // Pastikan flag selalu dilepas meski ada exception
+      _uploadInProgress = false;
       addLog(`❌ Upload exception: ${err.message}`);
       S.upload.res={success:false,msg:err.message};
       S.upload.step=5;re();
