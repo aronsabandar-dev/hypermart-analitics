@@ -963,23 +963,44 @@ const SB = (function(){
 
       addLog(`⬆ Insert ${rows.length} rows dalam ${chunks.length} batch...`);
       let insertedChunks = 0;
+
+      // Init progress state di S.upload
+      try{
+        if(typeof S!=='undefined'&&S.upload){
+          S.upload.progress={active:true,done:0,total:rows.length,pct:0};
+          re();
+        }
+      }catch(e){}
+
       try{
         for(const chunk of chunks){
           const {error:insErr} = await _client.from(table).insert(chunk);
           if(insErr) throw new Error(`Insert batch ${insertedChunks+1}/${chunks.length} gagal: ${insErr.message}`);
           total += chunk.length;
           insertedChunks++;
+          // Update progress state dan re-render setiap batch
+          try{
+            if(typeof S!=='undefined'&&S.upload){
+              const pct = Math.round((total/rows.length)*100);
+              S.upload.progress={active:true,done:total,total:rows.length,pct};
+              re();
+            }
+          }catch(e){}
           // Log progress setiap 5 chunk
           if(insertedChunks % 5 === 0 || insertedChunks === chunks.length){
             addLog(`⬆ Progress: ${total}/${rows.length} rows (batch ${insertedChunks}/${chunks.length})`);
           }
         }
       }catch(insError){
-        // Partial insert — rollback semua
+        // Partial insert — rollback semua, reset progress
         addLog(`⚠ Insert gagal di batch ${insertedChunks+1} — rollback...`, false);
+        try{ if(typeof S!=='undefined'&&S.upload) S.upload.progress={active:false,done:0,total:0,pct:0}; }catch(e){}
         await _client.from(table).delete().eq('year',year).eq('month',month).select('id');
         throw insError;
       }
+
+      // Reset progress setelah selesai
+      try{ if(typeof S!=='undefined'&&S.upload) S.upload.progress={active:false,done:0,total:0,pct:0}; }catch(e){}
 
       addLog(`✅ Push ${type} ${MONTHS[month-1]} ${year} — ${total} rows berhasil`);
       return {ok:true, count:total};
@@ -1218,7 +1239,7 @@ const S={
   neg:{year:0,month:0,dept:'all',sort:'sales_gap',dir:1,pg:1},
   dmg:{year:0,month:0,dept:'all',sort:'total_cost',dir:-1,pg:1},
   sku:{year:0,month:0,q:'',sel:null},
-  upload:{tab:'sales',step:1,year:0,month:0,file:null,prev:null,res:null},
+  upload:{tab:'sales',step:1,year:0,month:0,file:null,prev:null,res:null,progress:{active:false,done:0,total:0,pct:0}},
   hist:{filter:'all',tab:'upload'},
   dept:{year:0,month:0},
   cat:{year:0,month:0,dept:'all'},
@@ -2945,13 +2966,38 @@ function pageUpload(){
             <button class="btn btn-p" id="upProceed">Proceed to Confirm →</button>
           </div>`:`<button class="btn btn-s" style="margin-top:12px" id="upCancel">← Fix and Re-upload</button>`}
         `:''}
-        ${step===4?`
+        ${step===4?(()=>{
+          const pg=S.upload.progress;
+          const totalChunks=Math.ceil((prev?.rows.length||0)/250);
+          const doneChunks=Math.round((pg.done||0)/250);
+          return`
           <div class="alert-i" style="margin-bottom:16px">⚠ This will <strong>REPLACE</strong> all ${tab} data for <strong>${pl(y,m)}</strong> with ${prev?.rows.length} records.</div>
-          <div style="display:flex;gap:10px">
-            <button class="btn btn-s" id="upBack">← Back</button>
-            <button class="btn btn-p" id="upConfirm">Confirm — Replace ${pl(y,m)} ${tab.charAt(0).toUpperCase()+tab.slice(1)}</button>
-          </div>
-        `:''}
+          ${pg.active?`
+            <div style="margin-bottom:16px">
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+                <span style="font-size:12px;color:var(--t2)">Menyimpan ke Supabase...</span>
+                <span style="font-size:13px;font-weight:700;color:var(--pri)">${pg.pct}%</span>
+              </div>
+              <div style="background:var(--brd);border-radius:99px;height:10px;overflow:hidden">
+                <div style="height:100%;width:${pg.pct}%;background:linear-gradient(90deg,var(--pri),#60a5fa);border-radius:99px;transition:width .4s ease"></div>
+              </div>
+              <div style="font-size:11px;color:var(--tm);margin-top:6px;text-align:center">
+                ${(pg.done||0).toLocaleString('id')} / ${(pg.total||0).toLocaleString('id')} rows &nbsp;·&nbsp; batch ${doneChunks}/${totalChunks}
+              </div>
+            </div>
+            <div style="display:flex;gap:10px">
+              <button class="btn btn-s" disabled style="opacity:.4">← Back</button>
+              <button class="btn btn-p" disabled style="min-width:240px;opacity:.85">
+                ⏳ ${pg.pct}% — ${(pg.done||0).toLocaleString('id')} dari ${(pg.total||0).toLocaleString('id')} rows
+              </button>
+            </div>
+          `:`
+            <div style="display:flex;gap:10px">
+              <button class="btn btn-s" id="upBack">← Back</button>
+              <button class="btn btn-p" id="upConfirm">Confirm — Replace ${pl(y,m)} ${tab.charAt(0).toUpperCase()+tab.slice(1)}</button>
+            </div>
+          `}`;
+        })():''}
         ${step===5&&res?`
           ${res.success
             ?`<div class="sbox"><div style="font-size:32px;margin-bottom:10px">✓</div><div style="font-size:16px;font-weight:600;color:var(--green)">Import Successful</div><div style="font-size:13px;color:var(--t2);margin-top:6px">${res.rows} records imported for ${pl(y,m)}</div>${res.sbNote?`<div style="font-size:12px;margin-top:8px;padding:6px 12px;border-radius:6px;background:${res.sbNote.startsWith('☁')?'rgba(5,150,105,.08)':'rgba(220,38,38,.06)'};color:${res.sbNote.startsWith('☁')?'var(--green)':'var(--amber)'}">${esc(res.sbNote)}</div>`:SB.isConnected()?'':'<div style="font-size:11px;color:var(--tm);margin-top:6px">💡 Hubungkan ke Supabase di Settings → ☁ Supabase Cloud untuk backup otomatis.</div>'}</div>`
@@ -4035,7 +4081,7 @@ function bind(){
   }
 
   // Upload wizard buttons
-  const upc=document.getElementById('upCancel');if(upc)upc.onclick=()=>{S.upload.step=1;S.upload.prev=null;re();};
+  const upc=document.getElementById('upCancel');if(upc)upc.onclick=()=>{S.upload.step=1;S.upload.prev=null;S.upload.progress={active:false,done:0,total:0,pct:0};re()};
   const upp=document.getElementById('upProceed');if(upp)upp.onclick=()=>{S.upload.step=4;re();};
   const upb=document.getElementById('upBack');if(upb)upb.onclick=()=>{S.upload.step=3;re();};
   const upcf=document.getElementById('upConfirm');
@@ -4085,7 +4131,7 @@ function bind(){
       S.upload.step=5;re();
     }
   };
-  const upr=document.getElementById('upReset');if(upr)upr.onclick=()=>{S.upload.step=1;S.upload.prev=null;S.upload.res=null;re();};
+  const upr=document.getElementById('upReset');if(upr)upr.onclick=()=>{S.upload.step=1;S.upload.prev=null;S.upload.res=null;S.upload.progress={active:false,done:0,total:0,pct:0};re();};
 
   // History filter
   document.querySelectorAll('[data-hist-tab]').forEach(el=>el.onclick=()=>{S.hist.tab=el.dataset.histTab;re();});
