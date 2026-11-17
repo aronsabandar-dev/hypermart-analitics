@@ -1066,10 +1066,26 @@ const SB = (function(){
     let total=0;
     try{
       for(const type of types){
-        const {data,error} = await _client.from(`hm_${type}`).select('year,month').order('year').order('month');
-        if(error||!data) continue;
-        const seen=new Set(), periods=[];
-        data.forEach(r=>{ const k=`${r.year}_${r.month}`; if(!seen.has(k)){seen.add(k);periods.push(r);} });
+        // Gunakan RPC get_periods_X untuk dapat distinct year/month
+        // RPC tidak kena batas 1000 rows — wajib dijalankan di SQL Editor Supabase
+        let periods = [];
+        const {data:rpcData, error:rpcErr} = await _client.rpc(`get_periods_${type}`);
+        if(!rpcErr && rpcData){
+          periods = rpcData;
+        } else {
+          // Fallback jika RPC belum dibuat: ambil max 1000 distinct dari order desc
+          // (data terbaru duluan) agar periode terbaru tidak terlewat
+          addLog(`⚠ RPC get_periods_${type} tidak ditemukan — jalankan SQL Script terbaru di Supabase`, false);
+          const {data,error} = await _client
+            .from(`hm_${type}`)
+            .select('year,month')
+            .order('year', {ascending:false})
+            .order('month', {ascending:false})
+            .limit(1000);
+          if(error||!data) continue;
+          const seen=new Set();
+          data.forEach(r=>{ const k=`${r.year}_${r.month}`; if(!seen.has(k)){seen.add(k);periods.push(r);} });
+        }
         for(const {year,month} of periods){
           const count = await fetchPeriod(type,year,month);
           total+=count;
@@ -1226,12 +1242,14 @@ const SB = (function(){
         S.cat.year=dp2.y;S.cat.month=dp2.m;
         S.budg.year=dp2.y;S.budg.month=dp2.m;
         S.rep.year=dp2.y;S.rep.month=dp2.m;
-        // Restore HANYA halaman aktif dari localStorage — JANGAN restore year/month
-        // karena year/month sudah di-set oleh defPeriod() di atas berdasarkan data nyata.
-        // Restore year/month dari state lama (saat data belum ada) akan overwrite ke periode kosong.
+        // Restore HANYA halaman aktif dari localStorage
+        // year/month TIDAK di-restore — sudah di-set oleh defPeriod() berdasarkan data Supabase
         try{
           const saved = DB.g(NAV_STATE_KEY);
           if(saved && saved._v === NAV_STATE_VERSION && saved.page) S.page = saved.page;
+          // Hapus navState lama dari localStorage agar tidak dipakai lagi
+          // navState baru akan tersimpan saat user mulai navigasi setelah data loaded
+          DB.d(NAV_STATE_KEY);
         }catch(e){}
       }catch(e){}
       try{
@@ -1326,6 +1344,9 @@ const NAV_STATE_VERSION = 2; // naikkan jika struktur berubah
 
 function saveNavState(){
   try{
+    // Jangan simpan year/month saat loading screen aktif
+    // karena saat itu cache kosong dan defPeriod() return bulan sekarang (bukan periode data)
+    if(_appLoading) return;
     const state = {
       _v: NAV_STATE_VERSION,
       page: S.page,
@@ -3334,7 +3355,24 @@ alter table hm_damage enable row level security;
 -- Policy: izinkan semua operasi via anon key
 create policy "allow_all_hm_sales" on hm_sales for all using (true) with check (true);
 create policy "allow_all_hm_budget" on hm_budget for all using (true) with check (true);
-create policy "allow_all_hm_damage" on hm_damage for all using (true) with check (true);</pre>
+create policy "allow_all_hm_damage" on hm_damage for all using (true) with check (true);
+
+-- ⚠ WAJIB: RPC functions untuk get distinct periods (menghindari limit 1000 rows)
+-- Tanpa ini, pullAll hanya melihat 1000 rows pertama dan melewatkan periode terbaru
+create or replace function get_periods_sales()
+returns table(year int, month int)
+language sql security definer
+as $$ select distinct year, month from hm_sales order by year, month; $$;
+
+create or replace function get_periods_budget()
+returns table(year int, month int)
+language sql security definer
+as $$ select distinct year, month from hm_budget order by year, month; $$;
+
+create or replace function get_periods_damage()
+returns table(year int, month int)
+language sql security definer
+as $$ select distinct year, month from hm_damage order by year, month; $$;</pre>
                 <button class="btn btn-s btn-sm" id="copySqlScript" style="margin-top:6px">📋 Copy SQL Script</button>
               </div>
             </details>
