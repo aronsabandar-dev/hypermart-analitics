@@ -1236,25 +1236,10 @@ const SB = (function(){
   // ---- Auto pull setelah reconnect (online / channel error) ----
   // Mencegah data tertinggal saat device offline lalu online kembali.
   // Debounced 3 detik agar tidak langsung pull saat koneksi masih fluktuatif.
-  let _reconnectTimer = null;
-  function _scheduleReconnectPull(){
-    if(_reconnectTimer) clearTimeout(_reconnectTimer);
-    _reconnectTimer = setTimeout(async ()=>{
-      _reconnectTimer = null;
-      if(_status !== 'connected' || !_client) return;
-      addLog('🔄 Reconnect: sinkronisasi ulang data dari Supabase...');
-      // Tampilkan loading agar tidak render dengan cache kosong
-      _appLoading = true;
-      _appLoadMsg = '🔄 Menyinkronkan ulang data...';
-      try{ re(); }catch(e){}
-      // Re-subscribe Realtime agar channel aktif kembali
-      subscribeRealtime();
-      await pullAll();
-      _appLoading = false;
-      _appLoadMsg = '';
-      try{ re(); }catch(e){}
-    }, 8000); // 8 detik — cukup lama untuk koneksi mobile yang fluktuatif
-  }
+  // _scheduleReconnectPull tidak digunakan lagi di v7
+  // Arsitektur baru: IDB lokal + timestamp delta sync via _backgroundSync
+  // Tidak ada Realtime WebSocket = tidak ada reconnect loop
+  function _scheduleReconnectPull(){ /* disabled in v7 */ }
 
   // ---- Listener: device kembali online ----
   // Saat browser/tab kembali dari offline, Realtime WebSocket
@@ -1264,38 +1249,20 @@ const SB = (function(){
       addLog('🌐 Koneksi internet pulih — sinkronisasi ulang...');
       _scheduleReconnectPull();
     });
-    // visibilitychange: saat tab/app kembali aktif setelah lama di background
-    // Throttle: hanya pull jika terakhir pull lebih dari 5 menit yang lalu
-    // agar tidak membuang bandwidth saat user sering berpindah tab.
-    let _lastPullTime = 0;
-    const PULL_THROTTLE_MS = 5 * 60 * 1000; // 5 menit
-    const _origSchedule = _scheduleReconnectPull;
-    // Override pullAll untuk track waktu terakhir pull
-    const _origPullAll = pullAll;
-    pullAll = async function(){
-      _lastPullTime = Date.now();
-      return _origPullAll();
-    };
+    // visibilitychange: saat app kembali aktif dari background
+    // Dengan arsitektur IDB + timestamp sync, TIDAK perlu pullAll penuh
+    // Cukup jalankan _backgroundSync yang hanya cek hm_meta dan pull delta
+    let _lastVisibilitySync = 0;
+    const VISIBILITY_THROTTLE_MS = 10 * 60 * 1000; // 10 menit — tidak perlu terlalu sering
     document.addEventListener('visibilitychange', async ()=>{
-      if(document.visibilityState === 'visible' && _status === 'connected'){
-        const elapsed = Date.now() - _lastPullTime;
-        if(elapsed > PULL_THROTTLE_MS){
-          addLog('👁 App aktif kembali — memeriksa data terbaru...');
-          // Cek apakah koneksi Supabase masih aktual (bukan hanya status di memori)
-          // HP yang sleep lama bisa punya WebSocket putus meski _status masih 'connected'
-          try{
-            const {error} = await _client.from('hm_sales').select('id').limit(1);
-            if(error){
-              // Koneksi putus — reconnect dulu baru pull
-              addLog('🔄 Koneksi terputus saat sleep — menghubungkan ulang...', false);
-              await init(_cfg.url, _cfg.key);
-            }
-          }catch(e){
-            await init(_cfg.url, _cfg.key);
-          }
-          _scheduleReconnectPull();
-        }
-      }
+      if(document.visibilityState !== 'visible') return;
+      if(_status !== 'connected') return;
+      const elapsed = Date.now() - _lastVisibilitySync;
+      if(elapsed < VISIBILITY_THROTTLE_MS) return; // throttle 10 menit
+      _lastVisibilitySync = Date.now();
+      addLog('👁 App aktif kembali — cek update di background...');
+      // Jalankan delta sync — hanya pull bila ada perubahan di hm_meta
+      try{ await _backgroundSync(); }catch(e){}
     });
   }
 
@@ -1553,15 +1520,94 @@ function re(){
   const root=document.getElementById('app');
   if(!root) return;
 
-  // Tampilkan loading screen saat Supabase belum selesai pull data awal
+  // Tampilkan loading screen saat pull data awal
   if(_appLoading){
     root.innerHTML=`
-      <div style="min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:20px;background:var(--bgc)">
-        <div style="font-size:36px">📊</div>
-        <div style="font-weight:800;font-size:18px;color:var(--t1)">HM284 Analytics</div>
-        <div class="spin" style="width:36px;height:36px"></div>
-        <div style="font-size:13px;color:var(--t2);text-align:center;max-width:280px;line-height:1.6">${esc(_appLoadMsg)}</div>
-        <div style="font-size:11px;color:var(--tm)">Hypermart 284 Ambon City Center</div>
+      <style>
+        @keyframes hm-pulse{0%,100%{opacity:.15;transform:scale(1)}50%{opacity:.35;transform:scale(1.08)}}
+        @keyframes hm-spin{to{transform:rotate(360deg)}}
+        @keyframes hm-fadein{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:translateY(0)}}
+        @keyframes hm-bar{0%{width:0%}100%{width:92%}}
+        @keyframes hm-dot1{0%,80%,100%{transform:scale(0);opacity:0}40%{transform:scale(1);opacity:1}}
+        @keyframes hm-dot2{0%,100%{transform:scale(0);opacity:0}40%{transform:scale(1);opacity:1}}
+        @keyframes hm-scanline{0%{top:-40%}100%{top:140%}}
+        @keyframes hm-glow{0%,100%{box-shadow:0 0 24px rgba(59,130,246,.35)}50%{box-shadow:0 0 48px rgba(59,130,246,.7),0 0 80px rgba(99,102,241,.3)}}
+        @keyframes hm-float{0%,100%{transform:translateY(0)}50%{transform:translateY(-10px)}}
+        .hm-ls-wrap{position:fixed;inset:0;background:#050a18;display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:9999;overflow:hidden}
+        .hm-ls-grid{position:absolute;inset:0;background-image:linear-gradient(rgba(59,130,246,.06) 1px,transparent 1px),linear-gradient(90deg,rgba(59,130,246,.06) 1px,transparent 1px);background-size:48px 48px;mask-image:radial-gradient(ellipse 80% 80% at 50% 50%,black 40%,transparent 100%)}
+        .hm-ls-orb{position:absolute;border-radius:50%;filter:blur(80px);pointer-events:none}
+        .hm-ls-scanline{position:absolute;left:0;right:0;height:40px;background:linear-gradient(to bottom,transparent,rgba(59,130,246,.06),transparent);animation:hm-scanline 3.5s linear infinite;pointer-events:none}
+        .hm-ls-logo-wrap{animation:hm-float 3s ease-in-out infinite}
+        .hm-ls-ring{position:absolute;border-radius:50%;border:1px solid rgba(59,130,246,.2)}
+        .hm-ls-ring1{width:140px;height:140px;animation:hm-spin 8s linear infinite}
+        .hm-ls-ring2{width:170px;height:170px;border-color:rgba(99,102,241,.15);animation:hm-spin 12s linear infinite reverse}
+        .hm-ls-ring3{width:200px;height:200px;border-color:rgba(59,130,246,.08);animation:hm-spin 20s linear infinite}
+        .hm-ls-icon-bg{width:88px;height:88px;border-radius:24px;background:linear-gradient(135deg,#1e3a5f,#1e1b4b);border:1px solid rgba(99,130,246,.3);display:flex;align-items:center;justify-content:center;animation:hm-glow 2.5s ease-in-out infinite;position:relative}
+        .hm-ls-icon-bg::after{content:'';position:absolute;inset:0;border-radius:24px;background:linear-gradient(135deg,rgba(255,255,255,.08),transparent);pointer-events:none}
+        .hm-ls-title{font-size:26px;font-weight:800;letter-spacing:.08em;background:linear-gradient(135deg,#93c5fd,#c4b5fd,#60a5fa);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;animation:hm-fadein .6s ease both}
+        .hm-ls-sub{font-size:11px;letter-spacing:.18em;color:rgba(148,163,184,.5);text-transform:uppercase;animation:hm-fadein .6s .1s ease both}
+        .hm-ls-msg{font-size:12px;color:rgba(148,163,184,.7);letter-spacing:.04em;animation:hm-fadein .4s ease both;min-height:18px}
+        .hm-ls-track{width:220px;height:2px;background:rgba(255,255,255,.06);border-radius:99px;overflow:hidden;position:relative}
+        .hm-ls-fill{height:100%;background:linear-gradient(90deg,#3b82f6,#8b5cf6,#06b6d4);border-radius:99px;animation:hm-bar 4s cubic-bezier(.4,0,.2,1) forwards}
+        .hm-ls-dots{display:flex;gap:5px;align-items:center}
+        .hm-ls-dot{width:6px;height:6px;border-radius:50%;background:#3b82f6}
+        .hm-ls-dot:nth-child(1){animation:hm-dot1 1.2s .0s ease-in-out infinite}
+        .hm-ls-dot:nth-child(2){animation:hm-dot1 1.2s .2s ease-in-out infinite;background:#8b5cf6}
+        .hm-ls-dot:nth-child(3){animation:hm-dot1 1.2s .4s ease-in-out infinite;background:#06b6d4}
+        .hm-ls-corner{position:absolute;width:16px;height:16px;border-color:rgba(99,130,246,.4);border-style:solid}
+        .hm-ls-badge{font-size:9px;letter-spacing:.12em;color:rgba(99,130,246,.6);text-transform:uppercase;border:1px solid rgba(99,130,246,.2);padding:2px 8px;border-radius:99px;background:rgba(99,130,246,.05)}
+      </style>
+      <div class="hm-ls-wrap">
+        <!-- Grid background -->
+        <div class="hm-ls-grid"></div>
+        <!-- Scanline effect -->
+        <div class="hm-ls-scanline"></div>
+        <!-- Ambient orbs -->
+        <div class="hm-ls-orb" style="width:400px;height:400px;background:radial-gradient(circle,rgba(59,130,246,.12),transparent 70%);top:-100px;left:-100px;animation:hm-pulse 4s ease-in-out infinite"></div>
+        <div class="hm-ls-orb" style="width:350px;height:350px;background:radial-gradient(circle,rgba(99,102,241,.1),transparent 70%);bottom:-80px;right:-80px;animation:hm-pulse 5s 1s ease-in-out infinite"></div>
+        <!-- Corner decorations -->
+        <div class="hm-ls-corner" style="top:24px;left:24px;border-top-width:1.5px;border-left-width:1.5px;border-right:none;border-bottom:none"></div>
+        <div class="hm-ls-corner" style="top:24px;right:24px;border-top-width:1.5px;border-right-width:1.5px;border-left:none;border-bottom:none"></div>
+        <div class="hm-ls-corner" style="bottom:24px;left:24px;border-bottom-width:1.5px;border-left-width:1.5px;border-right:none;border-top:none"></div>
+        <div class="hm-ls-corner" style="bottom:24px;right:24px;border-bottom-width:1.5px;border-right-width:1.5px;border-left:none;border-top:none"></div>
+        <!-- Main content -->
+        <div style="display:flex;flex-direction:column;align-items:center;gap:20px;position:relative;z-index:1">
+          <!-- Logo with rings -->
+          <div class="hm-ls-logo-wrap" style="position:relative;width:200px;height:200px;display:flex;align-items:center;justify-content:center">
+            <div class="hm-ls-ring hm-ls-ring1"></div>
+            <div class="hm-ls-ring hm-ls-ring2"></div>
+            <div class="hm-ls-ring hm-ls-ring3"></div>
+            <div class="hm-ls-icon-bg">
+              <svg width="44" height="44" viewBox="0 0 44 44" fill="none">
+                <rect x="4" y="24" width="8" height="16" rx="2" fill="#3b82f6" opacity=".9"/>
+                <rect x="14" y="16" width="8" height="24" rx="2" fill="#8b5cf6" opacity=".9"/>
+                <rect x="24" y="8" width="8" height="32" rx="2" fill="#06b6d4" opacity=".9"/>
+                <rect x="34" y="18" width="6" height="22" rx="2" fill="#3b82f6" opacity=".6"/>
+                <path d="M4 22 L18 14 L28 18 L40 8" stroke="rgba(255,255,255,.4)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                <circle cx="18" cy="14" r="2" fill="white" opacity=".7"/>
+                <circle cx="28" cy="18" r="2" fill="white" opacity=".7"/>
+              </svg>
+            </div>
+          </div>
+          <!-- Title -->
+          <div style="text-align:center;display:flex;flex-direction:column;gap:6px">
+            <div class="hm-ls-title">HM284 ANALYTICS</div>
+            <div class="hm-ls-sub">Hypermart 284 · Ambon City Center</div>
+          </div>
+          <!-- Progress bar -->
+          <div style="display:flex;flex-direction:column;align-items:center;gap:10px;width:100%">
+            <div class="hm-ls-track"><div class="hm-ls-fill"></div></div>
+            <div class="hm-ls-dots">
+              <div class="hm-ls-dot"></div>
+              <div class="hm-ls-dot"></div>
+              <div class="hm-ls-dot"></div>
+            </div>
+          </div>
+          <!-- Status message -->
+          <div class="hm-ls-msg">${esc(_appLoadMsg)}</div>
+          <!-- Badge -->
+          <div class="hm-ls-badge">MPPA Retail Group</div>
+        </div>
       </div>`;
     return;
   }
